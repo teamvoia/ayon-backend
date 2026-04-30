@@ -1,7 +1,7 @@
 import os
 
 import aiocache
-from fastapi import Header, Query, Request, Response
+from fastapi import Query, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 
 from ayon_server.api.dependencies import (
@@ -10,6 +10,10 @@ from ayon_server.api.dependencies import (
     FileID,
     NoTraces,
     ProjectName,
+    XActivityIDOptional,
+    XContentType,
+    XFileIDOptional,
+    XFileName,
 )
 from ayon_server.api.responses import EmptyResponse
 from ayon_server.exceptions import (
@@ -37,10 +41,10 @@ async def upload_project_file(
     project_name: ProjectName,
     request: Request,
     user: CurrentUser,
-    x_file_id: str | None = Header(None),
-    x_file_name: str = Header(...),
-    x_activity_id: str | None = Header(None),
-    content_type: str = Header(...),
+    x_file_name: XFileName,
+    content_type: XContentType,
+    x_file_id: XFileIDOptional = None,
+    x_activity_id: XActivityIDOptional = None,
 ) -> CreateFileResponseModel:
     """Handle uploading a file to a project.
 
@@ -198,7 +202,7 @@ async def get_project_file(
     return RedirectResponse(url=url, status_code=302)
 
 
-@router.get("/{file_id}/info", response_model=FileInfo, dependencies=[AllowGuests])
+@router.get("/{file_id}/info", dependencies=[AllowGuests])
 async def get_project_file_info(
     project_name: ProjectName,
     file_id: FileID,

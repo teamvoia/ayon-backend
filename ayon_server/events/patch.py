@@ -168,7 +168,12 @@ def build_pl_entity_change_events(
             **common_data,
         }
 
-        old_attributes = original_entity.attrib.dict()
+        old_attributes = {
+            k: v
+            for k, v in original_entity.attrib.dict().items()
+            if k in original_entity.own_attrib
+        }
+
         for key in list(old_attributes.keys()):
             if key not in new_attributes:
                 old_attributes.pop(key)
@@ -241,9 +246,11 @@ def build_project_change_events(
     oval: Any
     nval: Any
 
+    etype = "project_skeleton" if original_entity.skeleton else "project"
+
     if new_attributes := patch_data.get("attrib", {}):
         evt: dict[str, Any] = {
-            "topic": "entity.project.attrib_changed",
+            "topic": f"entity.{etype}.attrib_changed",
             "description": "Changed project attributes",
             **common_data,
         }
@@ -297,7 +304,7 @@ def build_project_change_events(
                 description = "Project deactivated"
 
         evt = {
-            "topic": f"entity.project.{topic_name}",
+            "topic": f"entity.{etype}.{topic_name}",
             "description": description,
             **common_data,
         }
@@ -314,7 +321,7 @@ def build_project_change_events(
 
     result.append(
         {
-            "topic": "entity.project.changed",
+            "topic": f"entity.{etype}.changed",
             "description": f"Updated project {original_entity.name}",
             **common_data,
         }

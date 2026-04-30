@@ -15,7 +15,9 @@ from ayon_server.exceptions import (
     UnauthorizedException,
     UnsupportedMediaException,
 )
-from ayon_server.helpers.project_list import build_project_list, get_project_list
+from ayon_server.helpers.project_list import (
+    get_project_info,
+)
 from ayon_server.logging import logger
 from ayon_server.types import (
     ATTRIBUTE_NAME_REGEX,
@@ -30,17 +32,9 @@ from ayon_server.utils import (
     parse_api_key,
 )
 
-
-def dep_no_traces() -> None:
-    return None
-
-
-def dep_allow_guests() -> None:
-    return None
-
-
-NoTraces = Depends(dep_no_traces)
-AllowGuests = Depends(dep_allow_guests)
+NoTraces = Depends(lambda: None)
+AllowGuests = Depends(lambda: None)
+AllowProjectSkeleton = Depends(lambda: None)
 
 
 def dep_current_addon(request: Request) -> BaseServerAddon:
@@ -210,12 +204,15 @@ NewProjectName = Annotated[str, Depends(dep_new_project_name)]
 
 
 async def dep_project_name(
-    current_user: Annotated[UserEntity, Depends(dep_current_user)],
-    project_name: str = Path(
-        ...,
-        title="Project name",
-        regex=PROJECT_NAME_REGEX,
-    ),
+    request: Request,
+    current_user: CurrentUser,
+    project_name: Annotated[
+        str,
+        Path(
+            title="Project name",
+            regex=PROJECT_NAME_REGEX,
+        ),
+    ],
 ) -> str:
     """Validate and return a project name specified in an endpoint path.
 
@@ -226,33 +223,38 @@ async def dep_project_name(
 
     await current_user.ensure_project_access(project_name)
 
-    project_list = await get_project_list()
+    allow_skeleton = False
+    route = request.scope.get("route")
+    if isinstance(route, APIRoute):
+        if AllowProjectSkeleton in route.dependencies:
+            allow_skeleton = True
 
-    for pn in project_list:
-        if project_name.lower() == pn.name.lower():
-            return pn.name
+    project_info = await get_project_info(
+        project_name,
+        with_skeleton=True,  # query skeleton as well, as we need to check it below
+    )
+    validated_project_name = project_info.name
 
-    # try again
-    project_list = await build_project_list()
+    if project_info.skeleton and not allow_skeleton:
+        raise NotFoundException(
+            f"Project {project_name} is a skeleton and cannot be used in this endpoint"
+        )
 
-    for pn in project_list:
-        if project_name.lower() == pn.name.lower():
-            return pn.name
-
-    raise NotFoundException(f"Project {project_name} not found")
+    return validated_project_name
 
 
 ProjectName = Annotated[str, Depends(dep_project_name)]
 
 
 async def dep_project_name_or_underscore(
+    request: Request,
     current_user: Annotated[UserEntity, Depends(dep_current_user)],
     project_name: str = Path(..., title="Project name"),
 ) -> str:
     if project_name == "_":
         # TODO: check if user has access to all projects?
         return project_name
-    return await dep_project_name(current_user, project_name)
+    return await dep_project_name(request, current_user, project_name)
 
 
 ProjectNameOrUnderscore = Annotated[str, Depends(dep_project_name_or_underscore)]
@@ -432,6 +434,26 @@ async def dep_activity_id(
 ActivityID = Annotated[str, Depends(dep_activity_id)]
 
 
+async def dep_entity_list_id(
+    entity_list_id: str = Path(..., title="Entity list ID", **EntityID.META),
+) -> str:
+    """Validate and return an entity list id specified in an endpoint path."""
+    return entity_list_id
+
+
+EntityListID = Annotated[str, Depends(dep_entity_list_id)]
+
+
+async def dep_entity_list_item_id(
+    entity_list_item_id: str = Path(..., title="Entity list item ID", **EntityID.META),
+) -> str:
+    """Validate and return an entity list item id specified in an endpoint path."""
+    return entity_list_item_id
+
+
+EntityListItemID = Annotated[str, Depends(dep_entity_list_item_id)]
+
+
 async def dep_file_id(
     file_id: str = Path(..., title="File ID", **EntityID.META),
 ) -> str:
@@ -479,28 +501,43 @@ LinkType = Annotated[tuple[str, str, str], Depends(dep_link_type)]
 SITE_ID_REGEX = r"^[a-z0-9-]+$"
 
 
-def validate_site_id(site_id: str | None) -> None:
+def validate_site_id(site_id: str) -> str:
     """Raise a ValueError if the site id is invalid."""
+    if not site_id:
+        raise BadRequestException("Site id cannot be empty")
 
-    if site_id is not None and not re.match(SITE_ID_REGEX, site_id):
-        raise ValueError(f"Invalid site id: {site_id}")
+    if not re.match(SITE_ID_REGEX, site_id):
+        raise BadRequestException(f"Invalid site id: {site_id}")
+    return site_id
 
 
 async def dep_client_site_id(
-    param1: str | None = Query(
-        None, title="Site ID", alias="site_id", include_in_schema=False
-    ),
-    param2: str | None = Query(
-        None, title="Site ID", alias="site", include_in_schema=False
-    ),
-    x_ayon_site_id: str | None = Header(
-        None,
-        title="Site ID",
-        description=(
-            "Site ID may be specified either "
-            "as a query parameter (`site_id` or `site`) or in a header."
+    param1: Annotated[
+        str | None,
+        Query(
+            title="Site ID",
+            alias="site_id",
+            include_in_schema=False,
         ),
-    ),
+    ] = None,
+    param2: Annotated[
+        str | None,
+        Query(
+            title="Site ID",
+            alias="site",
+            include_in_schema=False,
+        ),
+    ] = None,
+    x_ayon_site_id: Annotated[
+        str | None,
+        Header(
+            title="Site ID",
+            description=(
+                "Site ID may be specified either "
+                "as a query parameter (`site_id` or `site`) or in a header."
+            ),
+        ),
+    ] = None,
 ) -> str | None:
     """Validate and return a site id
 
@@ -508,29 +545,34 @@ async def dep_client_site_id(
     This is usually used for request from the client application.
     """
     site_id = param1 or param2 or x_ayon_site_id
-    validate_site_id(site_id)
-    return site_id
+    if site_id is None:
+        return None
+    return validate_site_id(site_id)
 
 
 ClientSiteID = Annotated[str | None, Depends(dep_client_site_id)]
 
 
 async def dep_site_id(
-    param1: str | None = Query(
-        None,
-        title="Site ID",
-        alias="site_id",
-        description=(
-            "Site ID may be specified a query parameter. "
-            "Both `site_id` and its's alias `site` are supported."
+    param1: Annotated[
+        str | None,
+        Query(
+            title="Site ID",
+            alias="site_id",
+            description=(
+                "Site ID may be specified a query parameter. "
+                "Both `site_id` and its's alias `site` are supported."
+            ),
         ),
-    ),
-    param2: str | None = Query(
-        None,
-        title="Site ID",
-        alias="site",
-        include_in_schema=False,
-    ),
+    ] = None,
+    param2: Annotated[
+        str | None,
+        Query(
+            title="Site ID",
+            alias="site",
+            include_in_schema=False,
+        ),
+    ] = None,
 ) -> str | None:
     """Validate and return a site id specified as an query argument
 
@@ -538,8 +580,9 @@ async def dep_site_id(
     This is used for management / settings endpoints.
     """
     site_id = param1 or param2
-    validate_site_id(site_id)
-    return site_id
+    if site_id is None:
+        return None
+    return validate_site_id(site_id)
 
 
 SiteID = Annotated[str | None, Depends(dep_site_id)]
@@ -569,3 +612,48 @@ async def dep_sender_type(
 
 
 SenderType = Annotated[str | None, Depends(dep_sender_type)]
+
+
+async def dep_x_file_name(
+    x_file_name: str = Header(..., title="File name"),
+) -> str:
+    # TODO: Currently blocked by review drawovers, which rely on file names
+    # being allowed to contain path separators. In the future, we may need
+    # to reject file names containing "/" or "\\" to prevent path traversal.
+    return x_file_name
+
+
+XFileName = Annotated[str, Depends(dep_x_file_name)]
+
+
+XFileIDOptional = Annotated[
+    str | None,
+    Header(
+        alias="X-File-ID",
+        title="File ID",
+        **EntityID.META,
+    ),
+]
+
+XActivityIDOptional = Annotated[
+    str | None,
+    Header(
+        alias="X-Activity-ID",
+        title="Activity ID",
+        **EntityID.META,
+    ),
+]
+
+
+async def dep_x_content_type(
+    content_type: str = Header(..., title="Content type"),
+) -> str:
+    parts = content_type.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise BadRequestException("Invalid content type")
+    if not re.match(r"^[a-z0-9!#$&^_.+-]+$", parts[0], re.IGNORECASE):
+        raise BadRequestException("Invalid content type")
+    return content_type
+
+
+XContentType = Annotated[str, Depends(dep_x_content_type)]

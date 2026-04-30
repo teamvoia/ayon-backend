@@ -1,7 +1,6 @@
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
 
 from ayon_server.entities import FolderEntity
 from ayon_server.graphql.nodes.common import BaseNode, ThumbnailInfo
@@ -13,8 +12,10 @@ from ayon_server.utils import json_dumps
 if TYPE_CHECKING:
     from ayon_server.graphql.connections import ProductsConnection, TasksConnection
 else:
-    ProductsConnection = LazyType["ProductsConnection", "..connections"]
-    TasksConnection = LazyType["TasksConnection", "..connections"]
+    ProductsConnection = Annotated[
+        "ProductsConnection", strawberry.lazy("..connections")
+    ]
+    TasksConnection = Annotated["TasksConnection", strawberry.lazy("..connections")]
 
 
 @FolderEntity.strawberry_attrib()
@@ -46,6 +47,10 @@ class FolderNode(BaseNode):
     task_count: int = strawberry.field(default=0)
     has_versions: bool = strawberry.field(default=False)
     has_reviewables: bool = strawberry.field(default=False)
+    total_folder_count: int = strawberry.field(default=0)
+    total_task_count: int = strawberry.field(default=0)
+    total_product_count: int = strawberry.field(default=0)
+    total_version_count: int = strawberry.field(default=0)
 
     products: ProductsConnection = strawberry.field(
         resolver=get_products,
@@ -82,7 +87,7 @@ class FolderNode(BaseNode):
         return path.split("/")[:-1] if path else []
 
     @strawberry.field
-    async def parent(self, info: Info) -> Optional["FolderNode"]:
+    async def parent(self, info: Info) -> "FolderNode | None":
         if not self.parent_id:
             return None
         record = await info.context["folder_loader"].load(
@@ -155,6 +160,10 @@ async def folder_from_record(
         task_count=record.get("task_count", 0),
         has_reviewables=has_reviewables,
         has_versions=record.get("has_versions", False),
+        total_folder_count=record.get("total_folder_count", 0),
+        total_task_count=record.get("total_task_count", 0),
+        total_product_count=record.get("total_product_count", 0),
+        total_version_count=record.get("total_version_count", 0),
         path=path,
         _folder_path=path,
         _attrib=record["attrib"] or {},

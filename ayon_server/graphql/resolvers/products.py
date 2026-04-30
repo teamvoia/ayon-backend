@@ -38,6 +38,7 @@ SORT_OPTIONS = {
     "productType": "products.product_type",
     "productBaseType": "products.product_base_type",
     "folderName": "folders.name",
+    "folderType": "folders.folder_type",
     "status": "products.status",
     "createdAt": "products.created_at",
     "updatedAt": "products.updated_at",
@@ -451,7 +452,7 @@ async def get_products(
     #
 
     if search:
-        terms = slugify(search, make_set=True)
+        terms = slugify(search, make_set=True, split_chars=" ")
         for term in terms:
             sub_conditions = []
             term = term.replace("'", "''")
