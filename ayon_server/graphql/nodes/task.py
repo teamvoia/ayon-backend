@@ -1,24 +1,28 @@
 import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
 
 from ayon_server.entities import TaskEntity
 from ayon_server.graphql.nodes.common import BaseNode, ThumbnailInfo
+from ayon_server.graphql.nodes.entity_comment import EntityComment
 from ayon_server.graphql.resolvers.versions import get_versions
 from ayon_server.graphql.resolvers.workfiles import get_workfiles
 from ayon_server.graphql.types import Info
 from ayon_server.logging import logger
-from ayon_server.utils import json_dumps
+from ayon_server.utils import json_dumps, json_loads
 
 if TYPE_CHECKING:
-    from ayon_server.graphql.connections import VersionsConnection, WorkfilesConnection
-    from ayon_server.graphql.nodes.folder import FolderNode
+    from ..connections import VersionsConnection, WorkfilesConnection
+    from .folder import FolderNode
 else:
-    FolderNode = LazyType["FolderNode", ".folder"]
-    VersionsConnection = LazyType["VersionsConnection", "..connections"]
-    WorkfilesConnection = LazyType["WorkfilesConnection", "..connections"]
+    FolderNode = Annotated["FolderNode", strawberry.lazy(".folder")]
+    VersionsConnection = Annotated[
+        "VersionsConnection", strawberry.lazy("..connections")
+    ]
+    WorkfilesConnection = Annotated[
+        "WorkfilesConnection", strawberry.lazy("..connections")
+    ]
 
 
 @TaskEntity.strawberry_attrib()
@@ -51,6 +55,7 @@ class TaskNode(BaseNode):
     label: str | None
     task_type: str
     thumbnail_id: str | None = None
+    thumbnail_hash: str = strawberry.field()
     thumbnail: ThumbnailInfo | None = None
     assignees: list[str]
     folder_id: str
@@ -60,18 +65,19 @@ class TaskNode(BaseNode):
     data: str | None
     path: str | None = None
     subtasks: list[SubTaskNode] = strawberry.field(default_factory=list)
+    latest_comments: list[EntityComment] | None = strawberry.field(default=None)
 
     _inherited_attrib: strawberry.Private[dict[str, Any]]
     _folder_path: strawberry.Private[str | None] = None
 
     # GraphQL specifics
 
-    versions: "VersionsConnection" = strawberry.field(
+    versions: VersionsConnection = strawberry.field(
         resolver=get_versions,
         description=get_versions.__doc__,
     )
 
-    workfiles: "WorkfilesConnection" = strawberry.field(
+    workfiles: WorkfilesConnection = strawberry.field(
         resolver=get_workfiles,
         description=get_workfiles.__doc__,
     )
@@ -136,12 +142,13 @@ async def task_from_record(
 
     current_user = context["user"]
 
-    data: dict[str, Any] = {}
-    assignees: list[str] = []
+    assignees: list[str] = record["assignees"]
+    data: dict[str, Any] = record.get("data") or {}
+    thumbnail_hash = data.get("thumbnailHash") or record["id"][-6:]
 
-    if not current_user.is_guest:
-        assignees = record["assignees"]
-        data = record.get("data") or {}
+    if current_user.is_guest:
+        data = {}
+        assignees = []
 
     if "has_reviewables" in record:
         has_reviewables = record["has_reviewables"]
@@ -201,6 +208,11 @@ async def task_from_record(
         folder_path = "/" + record["_folder_path"].strip("/")
         path = f"{folder_path}/{record['name']}"
 
+    try:
+        latest_comments = json_loads(record.get("latest_comments") or "[]")
+    except Exception:
+        latest_comments = []
+
     return TaskNode(
         project_name=project_name,
         id=record["id"],
@@ -209,6 +221,7 @@ async def task_from_record(
         task_type=record["task_type"],
         thumbnail_id=record["thumbnail_id"],
         thumbnail=thumbnail,
+        thumbnail_hash=thumbnail_hash,
         assignees=assignees,
         folder_id=record["folder_id"],
         status=record["status"],
@@ -218,6 +231,7 @@ async def task_from_record(
         subtasks=subtasks,
         active=record["active"],
         path=path,
+        latest_comments=[EntityComment(**comment) for comment in latest_comments],
         created_at=record["created_at"],
         updated_at=record["updated_at"],
         created_by=record.get("created_by"),

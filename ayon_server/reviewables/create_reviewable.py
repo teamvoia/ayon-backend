@@ -5,6 +5,11 @@ from ayon_server.events import EventStream
 from ayon_server.exceptions import BadRequestException
 from ayon_server.files import Storages, create_project_file_record
 from ayon_server.helpers.ffprobe import availability_from_media_info
+from ayon_server.helpers.hierarchy_cache import rebuild_hierarchy_cache
+from ayon_server.helpers.preview import get_file_preview
+from ayon_server.helpers.thumbnails.invalidate_thumbnail import (
+    invalidate_thumbnail_by_entity,
+)
 from ayon_server.logging import logger
 from ayon_server.reviewables.models import ReviewableAuthor, ReviewableModel
 
@@ -125,6 +130,20 @@ async def create_reviewable(
         author = ReviewableAuthor(name=user.name, full_name=user.attrib.fullName)
     else:
         author = ReviewableAuthor(name="system", full_name=None)
+
+    # Ensure the file preview is generated and cached,
+    # so it is not generated when the client requests it for the first time,
+    # which would cause a delay for the user.
+    try:
+        await get_file_preview(project_name, file_id)
+    except Exception as e:
+        logger.warning(f"Failed to generate preview for reviewable {file_id}: {e}")
+
+    # Reset the thumbnail hash for the version,
+    # so the client will know to fetch a new thumbnail
+
+    await invalidate_thumbnail_by_entity(project_name, "version", version.id)
+    await rebuild_hierarchy_cache(project_name)
 
     return ReviewableModel(
         file_id=file_id,

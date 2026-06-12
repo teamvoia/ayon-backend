@@ -92,6 +92,8 @@ FViewVisibility = Annotated[
     ),
 ]
 
+FDisplayStyle = Literal["cards", "table", "playlist"] | None
+
 
 # Shared submodels
 
@@ -127,6 +129,7 @@ class OverviewSettings(OPModel):
     show_hierarchy: bool = True
     row_height: int | None = None
     group_by: str | None = None
+    group_sort_by_desc: bool = False
     show_empty_groups: bool = False
     sort_by: str | None = None
     sort_desc: bool = False
@@ -151,7 +154,8 @@ class ListsSettings(OPModel):
 
 
 class ReviewsSettings(ListsSettings):
-    pass
+    grid_height: int | None = None
+    display_style: FDisplayStyle = None
 
 
 class VersionsSettings(OPModel):
@@ -162,6 +166,7 @@ class VersionsSettings(OPModel):
     featured_version_order: list[str] | None = None
     slicer_type: str | None = None
     group_by: str | None = None
+    group_sort_by_desc: bool = False
     show_empty_groups: bool = False
     sort_by: str | None = None
     sort_desc: bool = False

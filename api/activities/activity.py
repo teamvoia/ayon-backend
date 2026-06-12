@@ -1,10 +1,8 @@
-from datetime import datetime
-from typing import Any
-
 from fastapi import BackgroundTasks
 
 from ayon_server.activities import (
-    ActivityType,
+    ActivityPatchModel,
+    ProjectActivityPostModel,
     create_activity,
     delete_activity,
     update_activity,
@@ -19,8 +17,6 @@ from ayon_server.api.dependencies import (
     PathEntityID,
     PathProjectLevelEntityType,
     ProjectName,
-    Sender,
-    SenderType,
 )
 from ayon_server.api.responses import EmptyResponse
 from ayon_server.entities import ProjectEntity
@@ -35,24 +31,12 @@ from ayon_server.types import Field, OPModel
 
 from .router import router
 
+human_activity_types = ["comment", "version.review"]
+
 
 async def delete_unused_files(project_name: str) -> None:
     storage = await Storages.project(project_name)
     await storage.delete_unused_files()
-
-
-class ProjectActivityPostModel(OPModel):
-    id: str | None = Field(None, description="Explicitly set the ID of the activity")
-    activity_type: ActivityType = Field(..., example="comment")
-    body: str = Field("", example="This is a comment")
-    tags: list[str] | None = Field(None, example=["tag1", "tag2"])
-    files: list[str] | None = Field(None, example=["file1", "file2"])
-    timestamp: datetime | None = Field(None, example="2021-01-01T00:00:00Z")
-    data: dict[str, Any] | None = Field(
-        None,
-        example={"key": "value"},
-        description="Additional data",
-    )
 
 
 class CreateActivityResponseModel(OPModel):
@@ -71,8 +55,6 @@ async def post_project_activity(
     user: CurrentUser,
     activity: ProjectActivityPostModel,
     background_tasks: BackgroundTasks,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> CreateActivityResponseModel:
     """Create an activity.
 
@@ -82,8 +64,8 @@ async def post_project_activity(
     """
 
     if not user.is_service:
-        if activity.activity_type not in ["comment"]:
-            raise BadRequestException("Humans can only create comments")
+        if activity.activity_type not in human_activity_types:
+            raise BadRequestException("Humans can only create comments/guest reviews")
 
     project = await ProjectEntity.load(project_name)
 
@@ -145,15 +127,13 @@ async def post_project_activity(
         body=activity.body,
         tags=activity.tags,
         files=activity.files,
-        user_name=user.name,
+        user=user,
         timestamp=activity.timestamp,
-        sender=sender,
-        sender_type=sender_type,
         data=activity.data,
         bump_entity_updated_at=True,
     )
 
-    if not user.is_service:
+    if not (user.is_service or user.is_guest):
         await ensure_watching(entity, user)
 
     background_tasks.add_task(delete_unused_files, project_name)
@@ -167,8 +147,6 @@ async def delete_project_activity(
     activity_id: ActivityID,
     user: CurrentUser,
     background_tasks: BackgroundTasks,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Delete an activity.
 
@@ -180,37 +158,11 @@ async def delete_project_activity(
         activity_id,
         user_name=user.name,
         is_admin=user.is_admin,
-        sender=sender,
-        sender_type=sender_type,
     )
 
     background_tasks.add_task(delete_unused_files, project_name)
 
     return EmptyResponse()
-
-
-class ActivityPatchModel(OPModel):
-    body: str | None = Field(
-        None,
-        example="This is a comment",
-        description="When set, update the activity body",
-    )
-    tags: list[str] | None = Field(
-        None,
-        example=["tag1", "tag2"],
-        description="When set, update the activity tags",
-    )
-    files: list[str] | None = Field(
-        None,
-        example=["file1", "file2"],
-        description="When set, update the activity files",
-    )
-    append_files: bool = Field(
-        False,
-        example=False,
-        description="When true, append files to the existing ones. replace them otherwise",  # noqa: E501
-    )
-    data: dict[str, Any] | None = Field(None, example={"key": "value"})
 
 
 @router.patch("/activities/{activity_id}", dependencies=[AllowGuests])
@@ -220,8 +172,6 @@ async def patch_project_activity(
     user: CurrentUser,
     activity: ActivityPatchModel,
     background_tasks: BackgroundTasks,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Edit an activity.
 
@@ -243,8 +193,6 @@ async def patch_project_activity(
         append_files=activity.append_files,
         data=activity.data,
         user_name=user_name,
-        sender=sender,
-        sender_type=sender_type,
         is_admin=user.is_admin,
     )
 

@@ -48,11 +48,66 @@ class SessionInfo:
         return f"SessionInfo(is_api_key={self.is_api_key})"
 
 
+async def validate_access_groups(user_data: dict[str, Any]) -> None:
+    """
+    Validate defaultAccessGroups and accessGroups in user data
+    and do in-place clean-up (delete non-existing groups and projects)
+    """
+    access_groups = user_data.get("accessGroups", {})
+    default_access_groups = user_data.get("defaultAccessGroups", [])
+
+    # if there are no groups, we don't need to do anything
+    if not (access_groups or default_access_groups):
+        # we don't need empty lists in data
+        user_data.pop("accessGroups", None)
+        user_data.pop("defaultAccessGroups", None)
+        return
+
+    # fetch existing groups and projects from DB
+
+    res = await Postgres.fetch("SELECT name FROM public.access_groups")
+    existing_access_groups = {row["name"] for row in res}
+    existing_projects = {p.name for p in await get_project_list(with_skeleton=True)}
+
+    # clean up non-existing groups and projects
+
+    default_access_groups = [
+        g for g in default_access_groups if g in existing_access_groups
+    ]
+
+    for pname in list(access_groups.keys()):
+        if pname not in existing_projects:
+            del access_groups[pname]
+            continue
+
+        groups = access_groups[pname]
+        groups = [g for g in groups if g in existing_access_groups]
+        if not groups:
+            access_groups.pop(pname, None)
+        else:
+            access_groups[pname] = groups
+
+    #
+    # Put back cleaned up groups to data, or remove empty lists
+    #
+
+    if not access_groups:
+        user_data.pop("accessGroups", None)
+    else:
+        user_data["accessGroups"] = access_groups
+
+    if not default_access_groups:
+        user_data.pop("defaultAccessGroups", None)
+    else:
+        user_data["defaultAccessGroups"] = default_access_groups
+
+
 class UserEntity(TopLevelEntity):
     entity_type: str = "user"
     model = ModelSet("user", attribute_library["user"], has_id=False)
     was_active: bool = False
-    original_email: str | None = None
+    was_admin: bool = False
+    was_manager: bool = False
     session: SessionInfo | None = None
 
     # Cache for path access lists
@@ -61,6 +116,10 @@ class UserEntity(TopLevelEntity):
     path_access_cache: dict[str, dict[AccessType, list[str]]] | None = None
     save_hooks: list[Callable[["UserEntity"], Awaitable[None]]] = []
     _teams: set[str] | None = None
+
+    _original_email: str | None = None
+    _original_avatar_url: str | None = None
+    _original_full_name: str | None = None
 
     #
     # Load
@@ -75,7 +134,13 @@ class UserEntity(TopLevelEntity):
         super().__init__(payload, exists, validate)
         self.was_active = self.active and self.exists
         self.was_service = self.is_service and self.exists
-        self.original_email = self.attrib.email
+        self.was_admin = self.is_admin and self.exists
+        self.was_manager = self.is_manager and self.exists
+
+        # initial values, to detect changes
+        self._original_email = self.attrib.email
+        self._original_full_name = self.attrib.fullName
+        self._original_avatar_url = self.attrib.avatarUrl
 
     @classmethod
     async def load(
@@ -140,7 +205,7 @@ class UserEntity(TopLevelEntity):
             if not self.active:
                 self.data.pop("userPool", None)
 
-            if self.attrib.email and (self.attrib.email != self.original_email):
+            if self.attrib.email and (self.attrib.email != self._original_email):
                 logger.info(f"Email changed for user {self.name}")
                 # Email changed, we need to check if it's unique
                 # We cannot use DB index here.
@@ -157,6 +222,8 @@ class UserEntity(TopLevelEntity):
                 if res:
                     msg = "This email is already used by another user"
                     raise ConstraintViolationException(msg)
+
+            await validate_access_groups(self.data)
 
             if do_con_check:
                 logger.info(f"Activating user {self.name}")
@@ -193,12 +260,21 @@ class UserEntity(TopLevelEntity):
                         **dict_exclude(self.dict(exclude_none=True), ["own_attrib"]),
                     )
                 )
-                await Redis.delete("user.avatar", self.name)
                 self.exists = True
+
+            if (
+                self._original_avatar_url != self.attrib.avatarUrl
+                or self._original_full_name != self.attrib.fullName
+            ):
+                await Redis.delete("user.avatar", self.name)
 
             if run_hooks:
                 for hook in self.save_hooks:
                     await hook(self)
+
+            if self.was_manager != self.is_manager:
+                await Redis.delete("global", "manager-names")
+
             return True
 
     #
@@ -238,6 +314,12 @@ class UserEntity(TopLevelEntity):
                     await Postgres.execute(query)
                 except Postgres.UndefinedTableError:
                     continue
+
+        if self.was_manager or self.is_manager:
+            await Redis.delete("global", "manager-names")
+        from ayon_server.auth.session import Session
+
+        await Session.logout_user(self.name, message="Account has been deleted")
 
         return res[0]["count"]
 

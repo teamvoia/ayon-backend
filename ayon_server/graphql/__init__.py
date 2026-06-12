@@ -140,6 +140,7 @@ class Query:
             is_manager=user.is_manager,
             is_service=user.is_service,
             is_developer=user.is_developer,
+            is_staging_allowed=user.is_staging_allowed,
             is_guest=user.is_guest,
             user_pool=user.data.get("userPool"),
             default_access_groups=user.data.get("defaultAccessGroups", []),
@@ -223,6 +224,6 @@ class AyonSchema(strawberry.Schema):
 
 router: GraphQLRouter[Any, Any] = GraphQLRouter(
     schema=AyonSchema(query=Query),
-    graphiql=False,
+    graphql_ide=None,
     context_getter=graphql_get_context,
 )
