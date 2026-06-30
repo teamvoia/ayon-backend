@@ -11,6 +11,10 @@ See .generator.FieldDefinition model for more information on specifiing
 field parameters.
 """
 
+from typing import Any, NotRequired, TypedDict
+
+from pydantic import BaseModel
+
 from ayon_server.entities.models.submodels import LinkTypeModel, RepresentationFileModel
 from ayon_server.types import (
     ENTITY_ID_EXAMPLE,
@@ -21,7 +25,24 @@ from ayon_server.types import (
     USER_NAME_REGEX,
 )
 
-project_fields = [
+
+class FieldDefinitionDict(TypedDict):
+    """TypedDict for field definition dictionaries."""
+
+    name: str
+    type: NotRequired[str]  # not required if list_of_submodels is provided
+    required: NotRequired[bool]
+    regex: NotRequired[str]
+    example: NotRequired[Any]
+    title: NotRequired[str]
+    description: NotRequired[str]
+    default: NotRequired[Any]
+    factory: NotRequired[str]
+    list_of_submodels: NotRequired[type[BaseModel]]
+    dynamic: NotRequired[bool]
+
+
+project_fields: list[FieldDefinitionDict] = [
     # Name is not here, since it's added by ModelSet class
     # (it is used as a primary key)
     {
@@ -31,6 +52,13 @@ project_fields = [
         "example": "prj",
         "title": "Project code",
         "required": True,
+    },
+    {
+        "name": "label",
+        "type": "string",
+        "title": "Project label",
+        "regex": LABEL_REGEX,
+        "example": "My awesome project",
     },
     {
         "name": "library",
@@ -99,6 +127,13 @@ project_fields = [
         "default": {},
         "title": "Project config",
     },
+    {
+        "name": "skeleton",
+        "type": "boolean",
+        "title": "Skeleton project",
+        "example": True,
+        "dynamic": True,
+    },
 ]
 
 user_fields = [
@@ -112,7 +147,7 @@ user_fields = [
 ]
 
 
-folder_fields = [
+folder_fields: list[FieldDefinitionDict] = [
     {
         "name": "name",
         "type": "string",
@@ -168,7 +203,7 @@ folder_fields = [
 ]
 
 
-task_fields = [
+task_fields: list[FieldDefinitionDict] = [
     {
         "name": "name",
         "type": "string",
@@ -224,7 +259,7 @@ task_fields = [
 ]
 
 
-product_fields = [
+product_fields: list[FieldDefinitionDict] = [
     {
         "name": "name",
         "type": "string",
@@ -270,7 +305,7 @@ product_fields = [
 ]
 
 
-version_fields = [
+version_fields: list[FieldDefinitionDict] = [
     {
         "name": "version",
         "type": "integer",
@@ -321,7 +356,7 @@ version_fields = [
 ]
 
 
-representation_fields = [
+representation_fields: list[FieldDefinitionDict] = [
     {
         "name": "name",
         "type": "string",
@@ -368,7 +403,7 @@ representation_fields = [
     },
 ]
 
-workfile_fields = [
+workfile_fields: list[FieldDefinitionDict] = [
     {
         "name": "path",
         "type": "string",
