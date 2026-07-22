@@ -1,3 +1,4 @@
+{% import "components.jinja2" as ui with context %}
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -29,19 +30,28 @@
                 style="background-color:#1C2026; height:104px; padding:17px 0;"
               >
                 <img
-                  src="https://static.ynput.team/AYON_whiteG_dot.png"
-                  alt="AYON Logo"
+                  src="{{ studio_logo_url }}"
+                  alt="Studio logo"
                   style="height:70px;"
                 />
               </td>
             </tr>
             {% endblock %}
 
+            <tr>
+              <td align="center" style="padding:24px 20px 0 20px;">
             {% block content %}
             {% endblock %}
+              </td>
+            </tr>
 
-            {% block footer %}
+            {% block call_to_action %}
             {% endblock %}
+
+            {% call ui.footer() %}
+              {% block footer %}
+              {% endblock %}
+            {% endcall %}
 
           </table>
         </td>

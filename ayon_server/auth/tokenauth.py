@@ -2,11 +2,13 @@ from typing import Any
 
 from fastapi import Request
 
+from ayon_server.addons.library import AddonLibrary
 from ayon_server.auth.session import Session
 from ayon_server.entities import UserEntity
 from ayon_server.exceptions import (
     BadRequestException,
     InvalidSettingsException,
+    NotImplementedException,
     UnauthorizedException,
 )
 from ayon_server.helpers.crypto import decrypt_json_urlsafe, encrypt_json_urlsafe
@@ -67,7 +69,7 @@ async def send_invite_email(
         ctx.update(context)
 
     template = EmailTemplate()
-    body = await template.render(body_template, ctx)
+    body = await template.render(body_template, base_url=base_url, context=ctx)
     subject = subject or "Invitation to Ayon instance"
 
     logger.debug(f"Sending guest invite to {email}: redirect to {redirect_url}")
@@ -100,11 +102,15 @@ async def send_extend_email(payload: TokenPayload, base_url: str) -> None:
     }
 
     template = EmailTemplate()
-    body = await template.render_template("token_renew.jinja", ctx)
+    body = await template.render_template(
+        "token_renew.jinja",
+        ctx,
+        base_url=base_url,
+    )
     subject = payload.subject or "Ayon access link renewal"
     logger.debug(
         f"Sending guest exted email to {payload.email}: "
-        "redirect to {payload.redirect_url}"
+        f"redirect to {payload.redirect_url}"
     )
     await send_mail([payload.email], subject, html=body)
 
@@ -113,16 +119,24 @@ async def create_guest_user_session(
     email: str,
     request: Request,
     *,
+    user_name: str | None = None,
     full_name: str | None = None,
     redirect_url: str | None = None,
+    guest_access: list[dict[str, Any]] | None = None,
 ) -> LoginResponseModel:
-    name = slugify(f"guest.{email}", separator=".")
+
+    if not user_name:
+        user_name = slugify(f"guest.{email}", separator=".")
+
+    user_data: dict[str, Any] = {"isGuest": True}
+    if guest_access:
+        user_data["guestAccess"] = guest_access
 
     user = UserEntity(
         payload={
-            "name": name,
+            "name": user_name,
             "attrib": {"email": email, "fullName": full_name},
-            "data": {"isGuest": True},
+            "data": user_data,
         }
     )
     session = await Session.create(user, request=request)
@@ -141,6 +155,16 @@ async def handle_token_auth_callback(
     request: Request,
     current_user: UserEntity | None = None,
 ) -> LoginResponseModel:
+
+    parts = token.split(".", 1)
+    addon_library = AddonLibrary.getinstance()
+    if parts[0] in addon_library.data:
+        addon_name = parts[0]
+        addon = await addon_library.get_production_addon(addon_name)
+        if not addon:
+            raise NotImplementedException(f"{addon_name} is not available")
+        return await addon.authorize_public_link(token, request, current_user)
+
     try:
         enc_data = await decrypt_json_urlsafe(token)
     except Exception:
@@ -152,16 +176,6 @@ async def handle_token_auth_callback(
         payload = TokenPayload(**enc_data.data)
     except Exception:
         raise BadRequestException("Invalid token payload format")
-
-    if current_user and current_user.session:
-        # user is already logged in. construct the response
-
-        return LoginResponseModel(
-            detail=f"User {current_user.name} already logged in",
-            token=current_user.session.token,
-            user=current_user.payload,
-            redirect_url=payload.redirect_url,
-        )
 
     if not await enc_data.validate_nonce():
         logger.debug(f"Token for guest user {payload.email} expired")
@@ -189,6 +203,10 @@ async def handle_token_auth_callback(
         # For future use. For now we only support guest users.
         msg = "Token is not for guest use"
         raise BadRequestException(msg)
+
+    if current_user and current_user.session:
+        # user is already logged in. invalidate the original session
+        await Session.delete(current_user.session.token)
 
     return await create_guest_user_session(
         email=payload.email,

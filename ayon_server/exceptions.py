@@ -64,6 +64,13 @@ class NotFoundException(AyonException):
     status: int = 404
 
 
+class TooManyRequestsException(AyonException):
+    """Exception raised when a user has sent too many requests at once."""
+
+    detail: str = "Too many requests"
+    status: int = 429
+
+
 class InvalidSettingsException(AyonException):
     """Exception raised when addon settings are invalid."""
 
@@ -135,3 +142,14 @@ class DeadlockException(AyonException):
 
     detail: str = "Database deadlock detected"
     status: int = 503
+
+
+class ImportRowErrorException(AyonException):
+    """Raised when a row in the CSV import has an unrecoverable error.
+
+    This exception is used when error_handling_mode is set to "abort",
+    meaning the entire import should stop immediately.
+    """
+
+    detail: str = "Import error"
+    status: int = 422  # Unprocessable Entity

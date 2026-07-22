@@ -1,9 +1,12 @@
+import asyncio
+import os
 import time
 from typing import Any
 
 import aiocache
 import psutil
 
+from ayon_server.helpers.project_list import get_project_list
 from ayon_server.lib.postgres import Postgres
 from ayon_server.lib.redis import Redis
 from ayon_server.types import Field, OPModel
@@ -93,15 +96,21 @@ class SystemMetrics:
         mem = psutil.virtual_memory()
         mem_usage = 100 * ((mem.total - mem.available) / mem.total)
 
+        process = psutil.Process(os.getpid())
+        proc_mem = process.memory_info()
+
         redis_size = await Redis.get_total_size()
 
         return [
             Metric("cpu_usage", psutil.cpu_percent()),
             Metric("memory_usage", mem_usage),
+            Metric("process_memory_rss", proc_mem.rss),
+            Metric("process_memory_vms", proc_mem.vms),
             Metric("swap_usage", psutil.swap_memory().percent),
             Metric("uptime_seconds", time.time() - self.boot_time),
             Metric("runtime_seconds", time.time() - self.run_time),
             Metric("redis_size_total", redis_size),
+            Metric("asyncio_tasks", len(asyncio.all_tasks())),
         ]
 
     async def render_prometheus(self) -> str:
@@ -127,9 +136,8 @@ class SystemMetrics:
     async def get_upload_sizes(self) -> list[Metric]:
         result: list[Metric] = []
 
-        q = "SELECT name FROM public.projects ORDER BY name"
-        projects = await Postgres.fetch(q)
-        project_names = [row["name"] for row in projects]
+        project_list = await get_project_list()
+        project_names = [p.name for p in project_list]
         total_size = 0
 
         for project_name in project_names:
