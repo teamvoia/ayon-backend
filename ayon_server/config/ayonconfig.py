@@ -173,11 +173,6 @@ class AyonConfig(BaseModel):
         description="Disable REST API documentation",
     )
 
-    audit_trail: bool = Field(
-        default=True,
-        description="Enable audit trail",
-    )
-
     openapi_include_internal_endpoints: bool = Field(
         default=False,
         description="Include internal endpoints in the OpenAPI schema",
@@ -213,6 +208,10 @@ class AyonConfig(BaseModel):
         default=120,
         description="The default timeout for HTTP requests the server uses "
         "to connect to external services",
+    )
+
+    offline_mode: bool = Field(
+        False, description="Do not attempt to reach external services"
     )
 
     ynput_cloud_api_url: str | None = Field(
@@ -274,6 +273,11 @@ class AyonConfig(BaseModel):
         description="Send saturated metrics to Ynput Cloud",
     )
 
+    metrics_disabled: bool = Field(
+        default=False,
+        description="Disable metrics collection and sending to Ynput Cloud",
+    )
+
     # Email settings
 
     email_from: str = Field("noreply@ynput.cloud", description="Email sender address")
@@ -304,6 +308,11 @@ class AyonConfig(BaseModel):
     default_project_storage_cdn_resolver: str | None = Field(
         default=None,
         description="Project files CDN resolver URL",
+    )
+
+    thumbnail_size: int = Field(
+        default=500,
+        description="Max width/height of generated thumbnails in pixels",
     )
 
     # Temporary / workarounds

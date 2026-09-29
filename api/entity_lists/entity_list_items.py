@@ -1,5 +1,7 @@
 from ayon_server.api.dependencies import (
     CurrentUser,
+    EntityListID,
+    EntityListItemID,
     ProjectName,
     Sender,
     SenderType,
@@ -17,17 +19,15 @@ from ayon_server.lib.postgres import Postgres
 from .router import router
 
 
-@router.post("/lists/{list_id}/items", status_code=201)
+@router.post("/lists/{entity_list_id}/items", status_code=201)
 async def create_entity_list_item(
     user: CurrentUser,
     project_name: ProjectName,
-    list_id: str,
-    sender: Sender,
-    sender_type: SenderType,
+    entity_list_id: EntityListID,
     payload: EntityListItemPostModel,
 ) -> None:
     async with Postgres.transaction():
-        entity_list = await EntityList.load(project_name, list_id, user=user)
+        entity_list = await EntityList.load(project_name, entity_list_id, user=user)
         await entity_list.ensure_can_update()
 
         await entity_list.add(
@@ -39,23 +39,23 @@ async def create_entity_list_item(
             data=payload.data,
             tags=payload.tags,
         )
-        await entity_list.save(sender=sender, sender_type=sender_type)
+        await entity_list.save()
 
 
-@router.patch("/lists/{list_id}/items/{list_item_id}")
+@router.patch("/lists/{entity_list_id}/items/{entity_list_item_id}")
 async def update_entity_list_item(
     user: CurrentUser,
     project_name: ProjectName,
-    list_id: str,
-    list_item_id: str,
+    entity_list_id: EntityListID,
+    entity_list_item_id: EntityListItemID,
     sender: Sender,
     sender_type: SenderType,
     payload: EntityListItemPatchModel,
 ) -> None:
     async with Postgres.transaction():
-        entity_list = await EntityList.load(project_name, list_id, user=user)
+        entity_list = await EntityList.load(project_name, entity_list_id, user=user)
         await entity_list.ensure_can_update()
-        item = entity_list.item_by_id(list_item_id)
+        item = entity_list.item_by_id(entity_list_item_id)
 
         payload_dict = payload.dict(exclude_unset=True)
         await entity_list.update(
@@ -66,19 +66,19 @@ async def update_entity_list_item(
         await entity_list.save(sender=sender, sender_type=sender_type)
 
 
-@router.delete("/lists/{list_id}/items/{list_item_id}")
+@router.delete("/lists/{entity_list_id}/items/{entity_list_item_id}")
 async def delete_entity_list_item(
     user: CurrentUser,
     project_name: ProjectName,
-    list_id: str,
-    list_item_id: str,
+    entity_list_id: EntityListID,
+    entity_list_item_id: EntityListItemID,
     sender: Sender,
     sender_type: SenderType,
 ) -> None:
     async with Postgres.transaction():
-        entity_list = await EntityList.load(project_name, list_id, user=user)
+        entity_list = await EntityList.load(project_name, entity_list_id, user=user)
         await entity_list.ensure_can_update()
-        await entity_list.remove(list_item_id)
+        await entity_list.remove(entity_list_item_id)
         await entity_list.save(sender=sender, sender_type=sender_type)
 
 
@@ -124,8 +124,13 @@ async def _multi_merge(
 
     for i, item in enumerate(payload):
         if item.id in existing_ids:
-            pos = i if item.position is None else item.position
             patched_fields = item.dict(exclude_unset=True).keys()
+            if "entity_id" in patched_fields and item.entity_id is None:
+                await entity_list.remove(item.id, normalize_positions=False)
+                existing_ids.remove(item.id)
+                continue
+
+            pos = i if item.position is None else item.position
             await entity_list.update(
                 item.id,
                 entity_id=item.entity_id,
@@ -156,6 +161,9 @@ async def _multi_merge(
                 tags=item.tags,
                 normalize_positions=False,
             )
+
+            if item.id:
+                existing_ids.add(item.id)
 
     entity_list.items.sort(key=lambda item: item.position)
     entity_list.normalize_positions()

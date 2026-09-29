@@ -26,12 +26,16 @@ async def clear_thumbnails(project_name: str) -> None:
             SELECT 1 FROM project_{project_name}.versions WHERE thumbnail_id = t.id
         ) AND NOT EXISTS (
             SELECT 1 FROM project_{project_name}.workfiles WHERE thumbnail_id = t.id
+        ) AND NOT EXISTS (
+            SELECT 1 FROM project_{project_name}.files WHERE thumbnail_id = t.id
         )
         RETURNING id
     """
 
     storage = await Storages.project(project_name)
     async for row in Postgres.iterate(query):
+        if row["id"] == "0" * 32:
+            continue
         await storage.delete_thumbnail(row["id"])
 
 

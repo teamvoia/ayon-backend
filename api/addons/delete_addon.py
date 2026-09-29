@@ -1,4 +1,5 @@
 import os
+from typing import Annotated
 
 import aioshutil
 from fastapi import Query
@@ -30,7 +31,7 @@ async def delete_addon_directory(addon_name: str, addon_version: str | None = No
 
         version_dir = addon.addon_dir
         try:
-            await aioshutil.rmtree(version_dir)
+            await aioshutil.rmtree(version_dir)  # type: ignore[call-arg]
         except Exception as e:
             raise AyonException(
                 f"Failed to delete {addon_name} {addon_version} directory: {e}"
@@ -41,7 +42,7 @@ async def delete_addon_directory(addon_name: str, addon_version: str | None = No
 
     if (addon_version is None) or is_empty:
         try:
-            await aioshutil.rmtree(addon_dir)
+            await aioshutil.rmtree(addon_dir)  # type: ignore[call-arg]
         except Exception as e:
             raise AyonException(f"Failed to delete {addon_name} directory: {e}")
         library.data.pop(addon_name, None)
@@ -52,7 +53,7 @@ async def delete_addon_directory(addon_name: str, addon_version: str | None = No
 async def delete_addon(
     user: CurrentUser,
     addon_name: str,
-    purge: bool = Query(False, title="Purge all data related to the addon"),
+    purge: Annotated[bool, Query(title="Purge all data related to the addon")] = False,
 ) -> EmptyResponse:
     """Delete an addon"""
 
@@ -73,7 +74,7 @@ async def delete_addon_version(
     user: CurrentUser,
     addon_name: str,
     addon_version: str,
-    purge: bool = Query(False, title="Purge all data related to the addon"),
+    purge: Annotated[bool, Query(title="Purge all data related to the addon")] = False,
 ) -> EmptyResponse:
     """Delete an addon version"""
 

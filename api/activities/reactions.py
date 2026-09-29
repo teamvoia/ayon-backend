@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import Path
 
@@ -9,8 +9,6 @@ from ayon_server.api.dependencies import (
     AllowGuests,
     CurrentUser,
     ProjectName,
-    Sender,
-    SenderType,
 )
 from ayon_server.entities import UserEntity
 from ayon_server.events.eventstream import EventStream
@@ -27,9 +25,6 @@ async def modify_reactions(
     user: UserEntity,
     reaction: str,
     action: Literal["add", "remove"],
-    *,
-    sender: str | None = None,
-    sender_type: str | None = None,
 ):
     """
 
@@ -121,8 +116,6 @@ async def modify_reactions(
         summary=summary,
         store=False,
         user=user.name,
-        sender=sender,
-        sender_type=sender_type,
     )
 
 
@@ -132,7 +125,13 @@ async def modify_reactions(
 
 
 class CreateReactionModel(OPModel):
-    reaction: str = Field(..., description="The reaction to be created", example="like")
+    reaction: Annotated[
+        str,
+        Field(
+            description="The reaction to be created",
+            example="like",
+        ),
+    ]
 
 
 @router.post(
@@ -145,8 +144,6 @@ async def create_reaction_to_activity(
     project_name: ProjectName,
     activity_id: ActivityID,
     request: CreateReactionModel,
-    sender: Sender,
-    sender_type: SenderType,
 ):
     if user.is_guest:
         await ensure_guest_can_react(user, project_name, activity_id)
@@ -157,8 +154,6 @@ async def create_reaction_to_activity(
         user,
         request.reaction,
         "add",
-        sender=sender,
-        sender_type=sender_type,
     )
 
 
@@ -171,14 +166,14 @@ async def delete_reaction_to_activity(
     user: CurrentUser,
     project_name: ProjectName,
     activity_id: ActivityID,
-    sender: Sender,
-    sender_type: SenderType,
-    reaction: str = Path(
-        ...,
-        description="The reaction to be deleted",
-        example="like",
-        regex=NAME_REGEX,
-    ),
+    reaction: Annotated[
+        str,
+        Path(
+            description="The reaction to be deleted",
+            example="like",
+            regex=NAME_REGEX,
+        ),
+    ],
 ):
     await modify_reactions(
         project_name,
@@ -186,6 +181,4 @@ async def delete_reaction_to_activity(
         user,
         reaction,
         "remove",
-        sender=sender,
-        sender_type=sender_type,
     )

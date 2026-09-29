@@ -12,7 +12,7 @@ from ayon_server.helpers.hierarchy_cache import rebuild_hierarchy_cache
 from ayon_server.lib.redis import Redis
 from ayon_server.logging import logger
 from ayon_server.types import OPModel
-from ayon_server.utils import camelize, json_dumps, json_loads
+from ayon_server.utils import RequestCoalescer, camelize, json_dumps, json_loads
 
 from .router import router
 
@@ -77,10 +77,13 @@ class FolderListItem(OPModel):
     has_tasks: bool = False
     has_children: bool = False
     has_reviewables: bool = False
+    thumbnail_hash: str
     task_names: list[str] | None
     tags: list[str] | None
     status: str
     attrib: dict[str, Any] | None = None
+    active: bool = True
+    visible: bool = True
     own_attrib: list[str] | None = None
     created_at: datetime.datetime
     updated_at: datetime.datetime
@@ -102,18 +105,8 @@ class FolderListLoader:
         self._executor = ThreadPoolExecutor(max_workers=10)
 
     async def get_folder_list(self, project_name: str) -> list[dict[str, Any]]:
-        async with self._lock:
-            if project_name not in self._current_futures:
-                self._current_futures[project_name] = asyncio.create_task(
-                    self._load_folders(project_name)
-                )
-
-        data = await self._current_futures[project_name]
-
-        async with self._lock:
-            self._current_futures.pop(project_name, None)
-
-        return data
+        coalesce = RequestCoalescer()
+        return await coalesce(self._load_folders, project_name)
 
     async def _load_folders(self, project_name: str) -> list[dict[str, Any]]:
         logger.trace(f"Loading folders for project {project_name}")
@@ -205,16 +198,16 @@ async def get_folder_list(
             media_type="application/json",
         )
 
-    start_time = time.monotonic()
+    start_time = time.perf_counter()
     access_checker = AccessChecker()
     await access_checker.load(user, project_name, "read")
 
-    elapsed_time = time.monotonic() - start_time
+    elapsed_time = time.perf_counter() - start_time
     logger.trace(f"Loaded folder access list in {elapsed_time:.3f} seconds")
 
-    start_time = time.monotonic()
+    start_time = time.perf_counter()
     entities = await folder_list_loader.get_folder_list(project_name)
-    elapsed_time = time.monotonic() - start_time
+    elapsed_time = time.perf_counter() - start_time
     ent_count = len(entities)
     me = f"{ent_count} folders {'with' if attrib else 'without'} attr of {project_name}"
     detail = f"{me} fetched in {elapsed_time:.3f} seconds"

@@ -3,12 +3,9 @@ from typing import Any, Literal
 from ayon_server.api.dependencies import (
     CurrentUser,
     ProjectName,
-    Sender,
-    SenderType,
     TaskID,
 )
 from ayon_server.api.responses import EmptyResponse, EntityIdResponse
-from ayon_server.config import ayonconfig
 from ayon_server.entities import TaskEntity
 from ayon_server.events import EventStream
 from ayon_server.exceptions import ForbiddenException
@@ -43,29 +40,18 @@ async def get_task(
 #
 
 
-@router.post(
-    "/projects/{project_name}/tasks",
-    status_code=201,
-    response_model=EntityIdResponse,
-)
+@router.post("/projects/{project_name}/tasks", status_code=201)
 async def create_task(
     post_data: TaskEntity.model.post_model,  # type: ignore
     user: CurrentUser,
     project_name: ProjectName,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EntityIdResponse:
     """Create a new task.
 
     Use a POST request to create a new task (with a new id).
     """
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
     ops.create("task", **post_data.dict(exclude_unset=True))
     res = await ops.process(can_fail=False, raise_on_error=True)
     entity_id = res.operations[0].entity_id
@@ -83,17 +69,10 @@ async def update_task(
     user: CurrentUser,
     project_name: ProjectName,
     task_id: TaskID,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Patch (partially update) a task."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
     ops.update("task", task_id, **post_data.dict(exclude_unset=True))
     await ops.process(can_fail=False, raise_on_error=True)
     return EmptyResponse()
@@ -109,17 +88,10 @@ async def delete_task(
     user: CurrentUser,
     project_name: ProjectName,
     task_id: TaskID,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Delete a task."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
     ops.delete("task", task_id)
     await ops.process(can_fail=False, raise_on_error=True)
     return EmptyResponse()
@@ -184,11 +156,10 @@ async def assign_users_to_task(
         "summary": {"entityId": task.id, "parentId": task.folder_id},
         "user": user.name,
     }
-    if ayonconfig.audit_trail:
-        event_payload["payload"] = {
-            "oldValue": list(original_assignees),
-            "newValue": list(assignees),
-        }
+    event_payload["payload"] = {
+        "oldValue": list(original_assignees),
+        "newValue": list(assignees),
+    }
 
     await EventStream.dispatch("entity.task.assignees_changed", **event_payload)
 

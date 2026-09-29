@@ -1,7 +1,6 @@
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
 
 from ayon_server.entities import WorkfileEntity
 from ayon_server.graphql.nodes.common import BaseNode, ThumbnailInfo
@@ -11,7 +10,7 @@ from ayon_server.utils import json_dumps
 if TYPE_CHECKING:
     from ayon_server.graphql.nodes.task import TaskNode
 else:
-    TaskNode = LazyType["TaskNode", ".task"]
+    TaskNode = Annotated["TaskNode", strawberry.lazy(".task")]
 
 
 @WorkfileEntity.strawberry_attrib()
@@ -26,6 +25,7 @@ class WorkfileNode(BaseNode):
     task_id: str | None
     thumbnail_id: str | None
     thumbnail: ThumbnailInfo | None = None
+    thumbnail_hash: str = strawberry.field()
     status: str
     data: str | None
     tags: list[str]
@@ -62,6 +62,7 @@ async def workfile_from_record(
     """Construct a version node from a DB row."""
 
     data = record.get("data") or {}
+    thumbnail_hash = data.get("thumbnailHash") or record["id"][-6:]
     npath = record["path"].replace("\\", "/")
     name = npath.split("/")[-1] if npath else ""
 
@@ -90,6 +91,7 @@ async def workfile_from_record(
         task_id=record["task_id"],
         thumbnail_id=record["thumbnail_id"],
         thumbnail=thumbnail,
+        thumbnail_hash=thumbnail_hash,
         active=record["active"],
         status=record["status"],
         tags=record["tags"],
