@@ -4,7 +4,11 @@ from typing import Annotated, Any
 import httpx
 
 from ayon_server.config import ayonconfig
-from ayon_server.exceptions import AyonException, ForbiddenException
+from ayon_server.exceptions import (
+    AyonException,
+    ForbiddenException,
+    ServiceUnavailableException,
+)
 from ayon_server.lib.postgres import Postgres
 from ayon_server.lib.redis import Redis
 from ayon_server.logging import logger
@@ -87,6 +91,14 @@ class YnputCloudInfoModel(OPModel):
         ),
     ] = False
 
+    offline_mode: Annotated[
+        bool,
+        Field(
+            description="AYON is in offline mode",
+            default_factory=lambda: ayonconfig.offline_mode,
+        ),
+    ]
+
 
 class CloudUtils:
     instance_id: str | None = None
@@ -107,7 +119,7 @@ class CloudUtils:
         from ayon_server.addons.library import AddonLibrary
 
         library = AddonLibrary.getinstance()
-        if library.get_addon_by_variant("ynputcloud", "production"):
+        if await library.get_addon_by_variant("ynputcloud", "production"):
             cls.admin_exists = True
             return True
 
@@ -132,6 +144,10 @@ class CloudUtils:
     @classmethod
     async def get_ynput_cloud_key(cls) -> str:
         """Get the Ynput Cloud key"""
+
+        if ayonconfig.offline_mode:
+            raise ServiceUnavailableException("AYON is in offline mode")
+
         ckey = await Redis.get("global", "ynput_cloud_key")
 
         if not ckey:
@@ -150,6 +166,9 @@ class CloudUtils:
 
     @classmethod
     async def get_api_headers(cls) -> dict[str, str]:
+        if ayonconfig.offline_mode:
+            raise ServiceUnavailableException("AYON is in offline mode")
+
         instance_id = await cls.get_instance_id()
         ynput_cloud_key = await cls.get_ynput_cloud_key()
         headers = {
@@ -173,8 +192,24 @@ class CloudUtils:
         await Redis.set("global", "ynput_cloud_key", key)
 
     @classmethod
-    async def remove_ynput_cloud_key(cls) -> None:
+    async def remove_ynput_cloud_key(
+        cls,
+        *,
+        disconnect_instance: bool = False,
+    ) -> None:
         """Remove the Ynput Cloud key from cache"""
+
+        if disconnect_instance:
+            try:
+                headers = await cls.get_api_headers()
+                async with httpx.AsyncClient(timeout=ayonconfig.http_timeout) as client:
+                    await client.delete(
+                        f"{ayonconfig.ynput_cloud_api_url}/api/ayon/info",
+                        headers=headers,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to disconnect from Ynput Cloud: {e}")
+
         query = "DELETE FROM public.secrets WHERE name = 'ynput_cloud_key'"
         await Postgres.execute(query)
         await cls.clear_cloud_info_cache()
@@ -203,8 +238,13 @@ class CloudUtils:
         instance_id = await cls.get_instance_id()
         try:
             ynput_cloud_key = await cls.get_ynput_cloud_key()
-        except Exception:
-            return YnputCloudInfoModel(instance_id=instance_id, subscriptions=[])
+        except (ServiceUnavailableException, ForbiddenException):
+            return YnputCloudInfoModel(
+                instance_id=instance_id,
+                subscriptions=[],
+                offline_mode=ayonconfig.offline_mode,
+            )
+
         data = await Redis.get_json("global", "cloudinfo")
         if (not data) or data.get("fetched_at", 0) < time.time() - 600 or force:
             return await cls.request_cloud_info(instance_id, ynput_cloud_key)
@@ -222,6 +262,9 @@ class CloudUtils:
             "x-ynput-server-version": __version__,
         }
         try:
+            if ayonconfig.offline_mode:
+                raise ServiceUnavailableException()
+
             async with httpx.AsyncClient(timeout=ayonconfig.http_timeout) as client:
                 res = await client.get(
                     f"{ayonconfig.ynput_cloud_api_url}/api/v1/me",
@@ -229,7 +272,10 @@ class CloudUtils:
                 )
                 if res.status_code in [401, 403]:
                     await cls.remove_ynput_cloud_key()
-                    raise ForbiddenException("Unable to connect to Ynput Cloud [ERR 0]")
+                    raise ForbiddenException(
+                        f"Unable to connect to Ynput Cloud [ERR {res.status_code}] "
+                        "(not authorized)"
+                    )
 
                 if res.status_code >= 400:
                     raise ForbiddenException(
@@ -239,6 +285,13 @@ class CloudUtils:
                 if not isinstance(data, dict):
                     raise ValueError(f"Invalid response from Ynput Cloud: {res.text}")
                 data["connected"] = True
+
+        except ServiceUnavailableException:
+            data = {
+                "instance_id": instance_id,
+                "connected": False,
+            }
+
         except Exception as e:
             logger.warning(f"Unable to connect to Ynput Cloud. Error: {e}")
             data = {
@@ -249,6 +302,28 @@ class CloudUtils:
         data["fetched_at"] = time.time()
         await Redis.set_json("global", "cloudinfo", data)
         return YnputCloudInfoModel(**data)
+
+    @classmethod
+    @Redis.cached("global", "required-addons", ttl=3600 * 48)
+    async def get_required_addons(cls) -> list[tuple[str, str]]:
+        if ayonconfig.offline_mode:
+            return []
+        try:
+            headers = await cls.get_api_headers()
+        except Exception:
+            return []
+
+        url = f"{ayonconfig.ynput_cloud_api_url}/api/v1/me"
+        headers["X-Ayon-Version"] = __version__
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, headers=headers, timeout=3)
+                response.raise_for_status()
+                data = response.json()
+                return data.get("requiredAddons", [])
+        except Exception as e:
+            logger.debug(f"Failed to fetch required addons list: {e}")
+            return []
 
 
 #

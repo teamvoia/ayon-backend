@@ -15,10 +15,18 @@ from ayon_server.graphql.resolvers.common import (
     resolve,
     sortdesc,
 )
-from ayon_server.graphql.resolvers.pagination import create_pagination
+from ayon_server.graphql.resolvers.pagination import (
+    OrderBy,
+    create_pagination,
+    get_sort_keys,
+    sort_columns,
+    with_tiebreakers,
+)
 from ayon_server.graphql.types import Info
 from ayon_server.sqlfilter import QueryFilter, build_filter
 from ayon_server.utils import SQLTool, json_loads
+
+from .common import build_search_conditions
 
 SORT_OPTIONS = {
     "label": "label",
@@ -53,7 +61,8 @@ async def get_entity_lists(
     before: ARGBefore = None,
     ids: ARGIds = None,
     filter: Annotated[str | None, argdesc("Filter tasks using QueryFilter")] = None,
-    sort_by: Annotated[str | None, sortdesc(SORT_OPTIONS)] = None,
+    search: Annotated[str | None, argdesc("Fuzzy text search filter")] = None,
+    sort_by: Annotated[list[str] | None, sortdesc(SORT_OPTIONS)] = None,
 ) -> EntityListsConnection:
     project_name = root.project_name
     sql_conditions = []
@@ -70,12 +79,24 @@ async def get_entity_lists(
         sql_conditions.append(f"id in {SQLTool.id_array(ids)}")
 
     if user.is_guest:
-        sql_conditions.append(f"""
-            (
-            access->>'guest:{user.attrib.email}' IS NOT NULL
-            OR (access->'__guests__')::INTEGER > 0
-            )
-            """)
+        if guest_access := user.data.get("guestAccess"):
+            ids = [
+                ga["id"]
+                for ga in guest_access
+                if ga.get("projectName") == project_name
+                and ga.get("type") == "entityList"
+                and ga.get("id")
+            ]
+            if not ids:
+                return EntityListsConnection()
+            sql_conditions.append(f"id in {SQLTool.id_array(ids)}")
+        else:
+            sql_conditions.append(f"""
+                (
+                access->>'guest:{user.attrib.email}' IS NOT NULL
+                OR (access->'__guests__')::INTEGER > 0
+                )
+                """)
 
     #
     # Filtering
@@ -87,18 +108,27 @@ async def get_entity_lists(
         if fcond := build_filter(fq, columns=FILTER_OPTIONS):
             sql_conditions.append(fcond)
 
+    if search:
+        if cond := build_search_conditions(search, ["label", "entity_type"]):
+            sql_conditions.append(cond)
+
     #
     # Pagination and sorting
     #
 
-    order_by = ["creation_order"]
-    if sort_by is not None:
-        if sort_by in SORT_OPTIONS:
-            order_by.insert(0, SORT_OPTIONS[sort_by])
-        elif sort_by == "path":
-            order_by = ["hierarchy.path", "tasks.name"]
+    order_by: OrderBy = []
+    for sort_key, descending in get_sort_keys(sort_by):
+        columns: list[str] = []
+        if sort_key in SORT_OPTIONS:
+            columns.append(SORT_OPTIONS[sort_key])
+        elif sort_key == "path":
+            columns.extend(["hierarchy.path", "tasks.name"])
         else:
-            raise BadRequestException(f"Invalid sort_by value: {sort_by}")
+            raise BadRequestException(f"Invalid sort_by value: {sort_key}")
+
+        order_by.extend(sort_columns(columns, descending))
+
+    order_by = with_tiebreakers(order_by, "creation_order")
 
     ordering, paging_conds, cursor = create_pagination(
         order_by,

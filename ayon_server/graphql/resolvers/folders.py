@@ -1,5 +1,5 @@
 import json
-from typing import Annotated
+from typing import Annotated, cast
 
 from ayon_server.entities import ProjectEntity
 from ayon_server.entities.core import attribute_library
@@ -8,6 +8,7 @@ from ayon_server.graphql.connections import FoldersConnection
 from ayon_server.graphql.edges import FolderEdge
 from ayon_server.graphql.nodes.folder import FolderNode
 from ayon_server.graphql.types import Info
+from ayon_server.helpers.hierarchy_cache import AYON_INTERNAL_FOLDER_NAME
 from ayon_server.sqlfilter import QueryFilter, build_filter
 from ayon_server.types import (
     validate_name,
@@ -15,7 +16,7 @@ from ayon_server.types import (
     validate_status_list,
     validate_type_name_list,
 )
-from ayon_server.utils import EntityID, SQLTool, slugify
+from ayon_server.utils import EntityID, SQLTool
 
 from .common import (
     ARGAfter,
@@ -23,16 +24,34 @@ from .common import (
     ARGFirst,
     ARGHasLinks,
     ARGIds,
+    ARGIncludeInternalFolder,
     ARGLast,
+    ARGVisibility,
     AttributeFilterInput,
+    ColumnMetadata,
+    EntityVisibility,
     FieldInfo,
     argdesc,
+    build_search_conditions,
+    create_child_folder_ctes,
     create_folder_access_list,
     get_has_links_conds,
     resolve,
     sortdesc,
 )
-from .pagination import create_pagination
+from .field_stats import (
+    MetricTargetInput,
+    generate_field_stats,
+    generate_specific_stats_columns,
+    generate_stats_columns,
+)
+from .pagination import (
+    OrderBy,
+    create_pagination,
+    get_sort_keys,
+    sort_columns,
+    with_tiebreakers,
+)
 from .sorting import (
     get_attrib_sort_case,
     get_folder_types_sort_case,
@@ -57,6 +76,10 @@ async def get_folders(
     last: ARGLast = None,
     before: ARGBefore = None,
     ids: ARGIds = None,
+    include_folder_children: Annotated[
+        bool,
+        argdesc("Include child folders when ids or parentIds is used"),
+    ] = False,
     parent_id: Annotated[
         str | None,
         argdesc(
@@ -102,8 +125,18 @@ async def get_folders(
     has_links: ARGHasLinks = None,
     search: Annotated[str | None, argdesc("Fuzzy text search filter")] = None,
     filter: Annotated[str | None, argdesc("Filter folders using QueryFilter")] = None,
-    task_filter: Annotated[str | None, argdesc("Fitler folders by tasks")] = None,
-    sort_by: Annotated[str | None, sortdesc(SORT_OPTIONS)] = None,
+    task_filter: Annotated[str | None, argdesc("Filter folders by tasks")] = None,
+    task_search: Annotated[str | None, argdesc("Fuzzy search folders by tasks")] = None,
+    sort_by: Annotated[list[str] | None, sortdesc(SORT_OPTIONS)] = None,
+    calculate_statistics: Annotated[
+        bool, argdesc("Whether to calculate column statistics")
+    ] = False,
+    calculate_specific_statistics: Annotated[
+        list[MetricTargetInput] | None,
+        argdesc("Map of attribute names to lists of desired statistical aggregations"),
+    ] = None,
+    include_internal_folder: ARGIncludeInternalFolder = False,
+    visibility: ARGVisibility = EntityVisibility.ALL,
 ) -> FoldersConnection:
     """Return a list of folders."""
 
@@ -145,7 +178,6 @@ async def get_folders(
     sql_having = []
 
     access_list = await create_folder_access_list(root, info)
-
     if access_list is not None:
         sql_conditions.append(
             f"hierarchy.path like ANY ('{{ {','.join(access_list)} }}')"
@@ -178,6 +210,62 @@ async def get_folders(
             ON folders.id = tasks.folder_id
             """
         )
+
+    # Total count fields (for delete info). Only computed when ids filter
+    # is provided to prevent expensive full-project scans.
+    if ids is not None:
+        if fields.has_any("totalFolderCount"):
+            sql_columns.append(
+                f"""
+                (SELECT COUNT(*) FROM project_{project_name}.hierarchy h2
+                WHERE starts_with(h2.path, hierarchy.path || '/')) AS total_folder_count
+                """
+            )
+
+        if fields.has_any("totalTaskCount"):
+            sql_columns.append(
+                f"""
+                (SELECT COUNT(*) FROM project_{project_name}.tasks t
+                JOIN project_{project_name}.hierarchy h2 ON t.folder_id = h2.id
+                WHERE h2.path = hierarchy.path
+                OR starts_with(h2.path, hierarchy.path || '/')) AS total_task_count
+                """
+            )
+
+        if fields.has_any("totalProductCount"):
+            sql_columns.append(
+                f"""
+                (SELECT COUNT(*) FROM project_{project_name}.products p
+                JOIN project_{project_name}.hierarchy h2 ON p.folder_id = h2.id
+                WHERE h2.path = hierarchy.path
+                OR starts_with(h2.path, hierarchy.path || '/')) AS total_product_count
+                """
+            )
+
+        if fields.has_any("totalVersionCount"):
+            sql_columns.append(
+                f"""
+                (SELECT COUNT(*) FROM project_{project_name}.versions v
+                JOIN project_{project_name}.products p ON v.product_id = p.id
+                JOIN project_{project_name}.hierarchy h2 ON p.folder_id = h2.id
+                WHERE h2.path = hierarchy.path
+                OR starts_with(h2.path, hierarchy.path || '/')) AS total_version_count
+                """
+            )
+    else:
+        # If no specific ids are requested,
+        # we can filter by visibility and internal folder
+        if not include_internal_folder:
+            sql_conditions.append(
+                f"(hierarchy.path <> '{AYON_INTERNAL_FOLDER_NAME}' AND "
+                f"NOT starts_with(hierarchy.path, '{AYON_INTERNAL_FOLDER_NAME}/'))"
+            )
+        if visibility == EntityVisibility.VISIBLE:
+            sql_conditions.append("(COALESCE(ex.active, TRUE) AND folders.active)")
+        elif visibility == EntityVisibility.HIDDEN:
+            sql_conditions.append(
+                "(NOT COALESCE(ex.active, TRUE) OR NOT folders.active)"
+            )
 
     if fields.any_endswith("hasReviewables"):
         sql_cte.append(
@@ -242,6 +330,50 @@ async def get_folders(
 
         sql_group_by.append("fwv.ancestor_id")
 
+    if fields.any_endswith("latestComments"):
+        sql_cte.append(
+            f"""
+            comments AS (
+                SELECT
+                    entity_id,
+                    json_agg(
+                        json_build_object(
+                            'activity_id', activity_id,
+                            'body', body,
+                            'author', author,
+                            'created_at', created_at
+                        )
+                        ORDER BY created_at DESC
+                    ) AS comments
+                FROM (
+                    SELECT
+                        activity_id,
+                        entity_id,
+                        body,
+                        activity_data->>'author' AS author,
+                        created_at,
+                        row_number() OVER (
+                            PARTITION BY entity_id
+                            ORDER BY created_at DESC
+                        ) AS rn
+                    FROM project_{project_name}.activity_feed
+                    WHERE activity_type = 'comment'
+                    AND entity_type = 'folder'
+                    AND reference_type = 'origin'
+                ) x
+                WHERE rn <= 5
+                GROUP BY entity_id
+            )
+            """
+        )
+        sql_columns.append("MIN(c.comments::text) AS latest_comments")
+        sql_joins.append(
+            """
+            LEFT JOIN comments c
+            ON c.entity_id = folders.id
+            """
+        )
+
     #
     # Conditions
     #
@@ -249,7 +381,13 @@ async def get_folders(
     if ids is not None:
         if not ids:
             return FoldersConnection()
-        sql_conditions.append(f"folders.id IN {SQLTool.id_array(ids)}")
+
+        if include_folder_children:
+            sql_cte.extend(create_child_folder_ctes(project_name, ids))
+            sql_conditions.append("folders.id IN (SELECT id FROM child_folder_ids)")
+
+        else:
+            sql_conditions.append(f"folders.id IN {SQLTool.id_array(ids)}")
 
     if parent_id is not None:
         # Still used. do not remove!
@@ -262,18 +400,26 @@ async def get_folders(
     if parent_ids is not None:
         if not parent_ids:
             return FoldersConnection()
-        pids_set = set(parent_ids)
-        lconds = []
-        if "root" in pids_set or None in pids_set:
+
+        if include_folder_children:
+            sql_cte.extend(
+                create_child_folder_ctes(project_name, parent_ids, include_self=False)
+            )
+            sql_conditions.append("folders.id IN (SELECT id FROM child_folder_ids)")
+        else:
+            pids_set: set[str | None] = set(parent_ids)
+            lconds = []
+            if "root" in pids_set or None in pids_set:
+                lconds.append("folders.parent_id IS NULL")
+
             pids_set.discard("root")
-            pids_set.discard(None)  # type: ignore
-            lconds.append("folders.parent_id IS NULL")
+            pids_set.discard(None)
 
-        if pids_set:
-            lconds.append(f"folders.parent_id IN {SQLTool.id_array(list(pids_set))}")
-
-        if lconds:
-            sql_conditions.append(f"({' OR '.join(lconds)})")
+            if pids_set:
+                pids_list = cast("list[str]", list(pids_set))
+                lconds.append(f"folders.parent_id IN {SQLTool.id_array(pids_list)}")
+            if lconds:
+                sql_conditions.append(f"({' OR '.join(lconds)})")
 
     if folder_types is not None:
         if not folder_types:
@@ -343,23 +489,21 @@ async def get_folders(
 
     if assignees is not None:
         validate_name_list(assignees)
-        cond = f"""
+        sql_conditions.append(
+            f"""
             folders.id IN (
                 SELECT folder_id FROM project_{project_name}.tasks
                 WHERE assignees @> {SQLTool.array(assignees, curly=True)}
             )
-        """
-        sql_conditions.append(cond)
+            """
+        )
 
     if search:
-        terms = slugify(search, make_set=True)
-        for term in terms:
-            term = term.replace("'", "''")
-            sql_conditions.append(
-                f"(folders.name ILIKE '%{term}%' OR "
-                f"folders.label ILIKE '%{term}%' OR "
-                f"hierarchy.path ILIKE '%{term}%')"
-            )
+        if cond := build_search_conditions(
+            search,
+            ["folders.name", "folders.label", "hierarchy.path"],
+        ):
+            sql_conditions.append(cond)
 
     #
     # Filter
@@ -389,12 +533,12 @@ async def get_folders(
             column_whitelist=column_whitelist,
             table_prefix="folders",
             column_map={
-                "attrib": "(pr.attrib || coalesce(ex.attrib, '{{}}'::jsonb ) || folders.attrib)",  # noqa: E501
+                "attrib": "(pr.attrib || coalesce(ex.attrib, '{}'::jsonb ) || folders.attrib)",  # noqa: E501
             },
         ):
             sql_conditions.append(fcond)
 
-    if task_filter:
+    if task_filter or task_search:
         column_whitelist = [
             "id",
             "name",
@@ -412,21 +556,39 @@ async def get_folders(
             "updated_by",
         ]
 
-        fdate = json.loads(task_filter)
-        fq = QueryFilter(**fdate)
-        tfilter = build_filter(
-            fq,
-            column_whitelist=column_whitelist,
-            table_prefix="tasks",
-        )
+        task_conditions = []
 
-        if tfilter:
+        if task_filter:
+            fdate = json.loads(task_filter)
+            fq = QueryFilter(**fdate)
+            if tfilter := build_filter(
+                fq,
+                column_whitelist=column_whitelist,
+                table_prefix="tasks",
+                column_map={
+                    "attrib": "(coalesce(ex.attrib, '{}'::jsonb ) || tasks.attrib)"
+                },
+            ):
+                task_conditions.append(tfilter)
+
+        if task_search:
+            if cond := build_search_conditions(
+                task_search,
+                ["tasks.name", "tasks.label", "tasks.task_type", "ex.path"],
+            ):
+                task_conditions.append(cond)
+
+        if task_conditions:
             sql_cte.append(
                 f"""
                 filtered_tasks AS (
-                    SELECT DISTINCT folder_id
-                    FROM project_{project_name}.tasks
-                    WHERE {tfilter}
+                    SELECT DISTINCT tasks.folder_id
+                    FROM project_{project_name}.tasks AS tasks
+                    INNER JOIN public.projects AS pr
+                        ON pr.name ILIKE '{project_name}'
+                    LEFT JOIN project_{project_name}.exported_attributes AS ex
+                        ON tasks.folder_id = ex.folder_id
+                    {SQLTool.conditions(task_conditions)}
                 )
                 """
             )
@@ -442,45 +604,51 @@ async def get_folders(
     # Pagination
     #
 
-    order_by = []
+    order_by: OrderBy = []
 
-    if sort_by is not None:
-        if sort_by == "folderType":
+    for sort_key, descending in get_sort_keys(sort_by):
+        columns: list[str] = []
+        if sort_key == "folderType":
             folder_type_case = get_folder_types_sort_case(project)
-            order_by.append(folder_type_case)
-        elif sort_by == "status":
+            columns.append(folder_type_case)
+        elif sort_key == "status":
             status_type_case = get_status_sort_case(project, "folders.status")
-            order_by.append(status_type_case)
-        elif sort_by in SORT_OPTIONS:
-            order_by.append(SORT_OPTIONS[sort_by])
-        elif sort_by.startswith("attrib."):
-            attr_name = sort_by[7:]
+            columns.append(status_type_case)
+        elif sort_key in SORT_OPTIONS:
+            columns.append(SORT_OPTIONS[sort_key])
+        elif sort_key.startswith("attrib."):
+            attr_name = sort_key[7:]
             exp = "(coalesce(ex.attrib, '{}'::JSONB) || folders.attrib)"
             attr_case = await get_attrib_sort_case(attr_name, exp)
-            order_by.append(attr_case)
+            columns.append(attr_case)
         else:
-            raise ValueError(f"Invalid sort_by value: {sort_by}")
+            raise ValueError(f"Invalid sort_by value: {sort_key}")
+
+        order_by.extend(sort_columns(columns, descending))
 
     if not order_by:
         # If no sorting specified, use creation order to have stable sorting
         # as the requester doesn't care about the order in this case.
         order_by.append("folders.creation_order")
 
-    elif len(order_by) < 2:
-        # If a single sort criteria is specified, add a secondary sort by name
-        # to have stable sorting when multiple items have the same value
-        # In this case we don't want to use creation order as secondary sort,
-        # because sorting is mainly invoked from the GUI and path makes more sense
-        order_by.append("hierarchy.path")
+    else:
+        # Add a secondary sort by path to have stable sorting when multiple
+        # items have the same values. In this case we don't want to use
+        # creation order as secondary sort, because sorting is mainly invoked
+        # from the GUI and path makes more sense
+        order_by = with_tiebreakers(order_by, "hierarchy.path")
 
-    ordering, paging_conds, cursor = create_pagination(
-        order_by,
-        first,
-        after,
-        last,
-        before,
-    )
-    sql_conditions.append(paging_conds)
+    ordering = ""
+    cursor = "''"
+    if not calculate_statistics and not calculate_specific_statistics:
+        ordering, paging_conds, cursor = create_pagination(
+            order_by,
+            first,
+            after,
+            last,
+            before,
+        )
+        sql_conditions.append(paging_conds)
 
     #
     # Query
@@ -492,8 +660,65 @@ async def get_folders(
     else:
         cte = ""
 
+    columns_metadata: list[ColumnMetadata] = [
+        ColumnMetadata("name", "string"),
+        ColumnMetadata("label", "string"),
+        ColumnMetadata("parent_id", "uuid"),
+        ColumnMetadata("thumbnail_id", "uuid"),
+        ColumnMetadata("path", "string"),
+        # Nested JSONB metrics
+        ColumnMetadata(
+            column_name="project_attributes_fps",
+            data_type="jsonb",
+            is_nested=True,
+            parent_json_column="project_attributes",
+            json_key="fps",
+            nested_sub_type="numeric",
+        ),
+        ColumnMetadata(
+            column_name="attrib_priority",
+            data_type="jsonb",
+            is_nested=True,
+            parent_json_column="attrib",
+            json_key="priority",
+            nested_sub_type="string",
+        ),
+        ColumnMetadata(
+            column_name="attrib_description",
+            data_type="jsonb",
+            is_nested=True,
+            parent_json_column="attrib",
+            json_key="description",
+            nested_sub_type="string",
+        ),
+    ]
+    if cte:
+        # has_reviewable only calculated in cte
+        columns_metadata.append(ColumnMetadata("has_reviewables", "bool"))
+
+    stats_select_clause = None
+    if calculate_specific_statistics:
+        stats_select_clause = generate_specific_stats_columns(
+            calculate_specific_statistics, True
+        )
+    elif calculate_statistics:
+        stats_select_clause = generate_stats_columns(columns_metadata)
+
+    raw_data_start = ""
+    raw_data_end = ""
+    if stats_select_clause:
+        cte_prefix = ",\n" if cte else "WITH"
+        raw_data_start = f"{cte_prefix} raw_data AS ("
+        raw_data_end = f"""
+        )
+        SELECT
+            {stats_select_clause}
+        FROM raw_data;
+        """
+
     query = f"""
         {cte}
+        {raw_data_start}
         SELECT {cursor}, {", ".join(sql_columns)}
         FROM project_{project_name}.folders AS folders
         {" ".join(sql_joins)}
@@ -501,11 +726,18 @@ async def get_folders(
         GROUP BY {",".join(sql_group_by)}
         {SQLTool.conditions(sql_having).replace("WHERE", "HAVING", 1)}
         {ordering}
+        {raw_data_end}
     """
     # Keep it here for debugging :)
     # from ayon_server.logging import logger
     #
-    # logger.debug(f"Folder query\n{query}")
+    # print("Folder query")
+    # print(query)
+
+    if stats_select_clause:
+        field_stats = await generate_field_stats(query)
+
+        return FoldersConnection(edges=[], field_stats=field_stats)
 
     return await resolve(
         FoldersConnection,
