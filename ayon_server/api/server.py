@@ -8,18 +8,21 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_redoc_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
 # okay. now the rest
 from ayon_server.api.auth import AuthMiddleware
-from ayon_server.api.dependencies import CurrentUserOptional
+from ayon_server.api.context import RequestContextMiddleware
+from ayon_server.api.dependencies import CurrentUser, CurrentUserOptional, NoTraces
 from ayon_server.api.lifespan import lifespan
 from ayon_server.api.logging import LoggingMiddleware
 from ayon_server.api.messaging import messaging
 from ayon_server.api.metadata import app_meta
+from ayon_server.api.readiness import ReadinessMiddleware
+from ayon_server.api.static import serve_static_file
 from ayon_server.background.log_collector import log_collector
 from ayon_server.config import ayonconfig
 from ayon_server.exceptions import ForbiddenException
@@ -44,8 +47,53 @@ app = FastAPI(
     **app_meta,
 )
 
+app.add_middleware(RequestContextMiddleware)
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(AuthMiddleware)
+app.add_middleware(ReadinessMiddleware)
+
+
+#
+# Liveness / readiness probes
+#
+
+# These live at the root and are registered before the SPA catch-all route.
+# They are registered directly on the app (bypassing
+# init_api/init_addon_endpoints) so they respond as soon as
+# the process is accepting connections - before the database, addons,
+# or the frontend have been initialized.
+
+
+@app.get("/livez", include_in_schema=False, dependencies=[NoTraces])
+async def livez() -> JSONResponse:
+    """Returns 200 while the process is alive and startup has not failed.
+
+    Intended for a Kubernetes livenessProbe: it must not depend on the
+    database, Redis, or addons being ready, otherwise a slow startup
+    (many addons, a slow DB) looks like a crash and the pod gets
+    restarted before it has a chance to finish booting.
+    If the startup task raised an unhandled exception the worker is
+    permanently broken; returning 500 lets the liveness probe trigger
+    a restart instead of leaving it stuck.
+    """
+
+    if getattr(app.state, "startup_failed", False):
+        return JSONResponse(status_code=500, content={"status": "startup failed"})
+    return JSONResponse(status_code=200, content={"status": "alive"})
+
+
+@app.get("/readyz", include_in_schema=False, dependencies=[NoTraces])
+async def readyz() -> JSONResponse:
+    """Returns 200 once startup (db/redis/addons/frontend) has finished.
+
+    Intended for a Kubernetes readinessProbe/startupProbe: while this
+    returns 503 the pod should stay out of Service rotation, but should
+    NOT be restarted.
+    """
+
+    if getattr(app.state, "ready", False):
+        return JSONResponse(status_code=200, content={"status": "ready"})
+    return JSONResponse(status_code=503, content={"status": "starting"})
 
 
 #
@@ -75,6 +123,26 @@ async def openapi(user: CurrentUserOptional) -> dict[str, Any]:
     )
 
 
+@app.get("/docs/redoc.standalone.js", include_in_schema=False)
+async def redocs_static_js(user: CurrentUserOptional) -> FileResponse:
+    """Serve Redoc static JS file"""
+
+    if ayonconfig.disable_rest_docs:
+        raise ForbiddenException("OpenAPI documentation is disabled")
+
+    if ayonconfig.openapi_require_authentication:
+        if user is None:
+            raise ForbiddenException(
+                "You must be logged in to access API documentation"
+            )
+        if not user.is_manager:
+            raise ForbiddenException("You are not allowed to access API documentation")
+
+    return FileResponse(
+        pathlib.Path("static/redoc.standalone.js"),
+    )
+
+
 @app.get("/docs", include_in_schema=False)
 async def docs(user: CurrentUserOptional) -> HTMLResponse:
     """Return the OpenAPI documentation page"""
@@ -94,6 +162,7 @@ async def docs(user: CurrentUserOptional) -> HTMLResponse:
     return get_redoc_html(
         openapi_url="/openapi.json",
         title=app_meta["title"],
+        redoc_js_url="/docs/redoc.standalone.js",
     )
 
 
@@ -186,10 +255,13 @@ app.include_router(
 
 
 @app.get("/graphiql", include_in_schema=False)
-def explorer() -> HTMLResponse:
-    page = pathlib.Path("static/graphiql.html").read_text()
-    page = page.replace("{{ SUBSCRIPTION_ENABLED }}", "false")  # TODO
-    return HTMLResponse(page, 200)
+def graphiql_root(_: CurrentUser) -> FileResponse:
+    return serve_static_file("static/graphiql", "index.html")
+
+
+@app.get("/graphiql/{path:path}", include_in_schema=False)
+async def explorer(path: str, _: CurrentUser) -> FileResponse:
+    return serve_static_file("static/graphiql", path)
 
 
 #

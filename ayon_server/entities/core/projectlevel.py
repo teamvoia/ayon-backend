@@ -16,7 +16,7 @@ from ayon_server.helpers.entity_links import remove_entity_links
 from ayon_server.helpers.statuses import get_default_status_for_entity
 from ayon_server.lib.postgres import Postgres
 from ayon_server.types import ProjectLevelEntityType
-from ayon_server.utils import EntityID, SQLTool, dict_exclude
+from ayon_server.utils import SQLTool, dict_exclude
 
 BASE_GET_QUERY = """
     SELECT *
@@ -182,9 +182,6 @@ class ProjectLevelEntity(BaseEntity):
         the attributes inherited from parent entities.
         """
 
-        if EntityID.parse(entity_id) is None:
-            raise ValueError(f"Invalid {cls.entity_type} ID specified")
-
         query = cls.base_get_query.format(
             project_name=project_name,
             entity_type=cls.entity_type,
@@ -234,6 +231,7 @@ class ProjectLevelEntity(BaseEntity):
                         attrib[key] = value
 
             if self.exists:
+                await self.pre_save(False)
                 # Update existing entity
                 fields = dict_exclude(
                     self.dict(),
@@ -243,7 +241,6 @@ class ProjectLevelEntity(BaseEntity):
                 fields["updated_at"] = datetime.now()
                 fields["updated_by"] = kwargs.get("user_name", None)
 
-                await self.pre_save(False)
                 await Postgres.execute(
                     *SQLTool.update(
                         f"project_{self.project_name}.{self.entity_type}s",
@@ -253,6 +250,7 @@ class ProjectLevelEntity(BaseEntity):
                 )
 
             else:
+                await self.pre_save(True)
                 # Create a new entity
                 fields = dict_exclude(
                     self.dict(exclude_none=True),
@@ -262,7 +260,6 @@ class ProjectLevelEntity(BaseEntity):
                 fields["created_by"] = kwargs.get("user_name", None)
                 fields["updated_by"] = kwargs.get("user_name", None)
 
-                await self.pre_save(True)
                 await Postgres.execute(
                     *SQLTool.insert(
                         f"project_{self.project_name}.{self.entity_type}s",
@@ -273,11 +270,11 @@ class ProjectLevelEntity(BaseEntity):
             if auto_commit:
                 await self.commit()
 
-    async def commit(self) -> None:
-        await self.refresh_views(self.project_name)
+    async def commit(self, **kwargs: Any) -> None:
+        await self.refresh_views(self.project_name, **kwargs)
 
     @classmethod
-    async def refresh_views(cls, project_name: str) -> None:
+    async def refresh_views(cls, project_name: str, **kwargs) -> None:
         """Refresh the views for the entity type in the given project.
 
         This method should be overridden in subclasses to refresh.

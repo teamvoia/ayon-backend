@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 from typing import Any, cast
 
@@ -5,9 +6,15 @@ from ayon_server.entities import FolderEntity, UserEntity
 from ayon_server.entities.core import ProjectLevelEntity
 from ayon_server.events.patch import build_pl_entity_change_events
 from ayon_server.exceptions import BadRequestException, ForbiddenException
+from ayon_server.helpers.thumbnails.invalidate_thumbnail import (
+    invalidate_version_parents_thumbnails,
+    thumbnail_updated_event,
+)
 from ayon_server.lib.postgres import Postgres
+from ayon_server.lib.redis import Redis
+from ayon_server.logging import logger
 
-from .hooks import OperationHooks
+from .hooks import HookResult, OperationHooks
 from .models import OperationModel
 from .validation import validate_task
 
@@ -113,6 +120,8 @@ async def update_project_level_entity(
     )
     entity = await entity_class.load(project_name, operation.entity_id)
 
+    calculated_attributes: set[str] = set()
+
     hooks = OperationHooks.hooks()
     if hooks:
         temp_entity = entity_class(project_name, entity.payload.dict())
@@ -121,7 +130,9 @@ async def update_project_level_entity(
         temp_entity.patch(temp_payload, user=user)
 
         for hook in hooks:
-            await hook(operation, temp_entity, user)
+            res = await hook(operation, temp_entity, user)
+            if isinstance(res, HookResult) and res.calculated_attributes:
+                calculated_attributes.update(res.calculated_attributes)
 
     # Casting the payload to the model class is used to validate the data
     payload = entity_class.model.patch_model(**operation.data)
@@ -144,7 +155,11 @@ async def update_project_level_entity(
     # Build events for every change
     # Do this before applying the patch, to the entity to detect the changes
 
-    events = build_pl_entity_change_events(entity, payload)
+    events = build_pl_entity_change_events(
+        entity,
+        payload,
+        calculated_attributes=calculated_attributes,
+    )
     if user:
         for event in events:
             event["user"] = user.name
@@ -153,7 +168,23 @@ async def update_project_level_entity(
     # pre_save method of the entity, that expects the payload to be
     # updated (that covers various entity-specific logic, validtion, etc.).
 
+    version_thumbnail_changed = (
+        entity.entity_type == "version"
+        and "thumbnail_id" in update_payload_dict
+        and update_payload_dict["thumbnail_id"] != entity.thumbnail_id
+    )
+
     entity.patch(payload, user=user)
+
+    if "thumbnail_id" in update_payload_dict:
+        # if thumbnail is updated, we need to bump thumbnail hash in data
+        if "data" not in update_payload_dict:
+            update_payload_dict["data"] = {}
+        logger.trace(
+            f"Thumbnail updated for {project_name} {entity.entity_type} {entity.id}, "
+        )
+        update_payload_dict["data"]["thumbnailHash"] = uuid.uuid4().hex[:6]
+        await Redis.delete("thumbnail-info", f"{project_name}:{entity.id}")
 
     # Add the following fields directly to update_payload_dict
     # They don't affect the events created, so they don't need to be
@@ -181,5 +212,14 @@ async def update_project_level_entity(
 
     await entity.pre_save(False)
     await Postgres.execute(query, *params)
+
+    if version_thumbnail_changed:
+        # Folders and tasks may inherit the version thumbnail,
+        # so their thumbnails need to be invalidated as well.
+        # Events are returned, so they are dispatched after the commit.
+        for affected in await invalidate_version_parents_thumbnails(
+            project_name, [entity.id]
+        ):
+            events.append(thumbnail_updated_event(project_name, affected))
 
     return entity.id, events, 204

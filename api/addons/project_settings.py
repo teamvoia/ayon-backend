@@ -7,7 +7,7 @@ from pydantic.error_wrappers import ValidationError
 from ayon_server.addons import AddonLibrary
 from ayon_server.api.dependencies import CurrentUser, ProjectName, SiteID
 from ayon_server.api.responses import EmptyResponse
-from ayon_server.config import ayonconfig
+from ayon_server.bundles.project_bundles import has_project_bundle_addon
 from ayon_server.entities import ProjectEntity
 from ayon_server.events import EventStream
 from ayon_server.exceptions import (
@@ -191,22 +191,34 @@ async def set_addon_project_settings(
             write=True,
         )
 
-        original = await addon.get_project_settings(project_name, variant=variant)
-        existing = await addon.get_project_overrides(project_name, variant=variant)
+        is_project_bundle_addon = await has_project_bundle_addon(
+            project_name,
+            addon_name,
+            variant=variant,
+        )
 
-        if original is None:
-            # This addon does not have settings
-            raise BadRequestException(f"Addon {addon_name} has no settings")
-        try:
-            data = extract_overrides(
-                original,
-                model(**payload),
-                existing=existing,
-                explicit_pins=explicit_pins,
-                explicit_unpins=explicit_unpins,
-            )
-        except ValidationError as e:
-            raise BadRequestException("Invalid settings", errors=e.errors()) from e
+        if variant in ("production", "staging") and is_project_bundle_addon:
+            # If the addon uses a project bundle, we cannot process the overrides
+            # and we're storing the entire model
+            data = payload
+
+        else:
+            original = await addon.get_project_settings(project_name, variant=variant)
+            existing = await addon.get_project_overrides(project_name, variant=variant)
+
+            if original is None:
+                # This addon does not have settings
+                raise BadRequestException(f"Addon {addon_name} has no settings")
+            try:
+                data = extract_overrides(
+                    original,
+                    model(**payload),
+                    existing=existing,
+                    explicit_pins=explicit_pins,
+                    explicit_unpins=explicit_unpins,
+                )
+            except ValidationError as e:
+                raise BadRequestException("Invalid settings", errors=e.errors()) from e
 
         await set_addon_settings(
             addon_name=addon_name,
@@ -259,6 +271,19 @@ async def delete_addon_project_overrides(
     site_id: SiteID,
     variant: str = Query("production"),
 ):
+    if variant in ("production", "staging") and site_id is None:
+        is_project_bundle_addon = await has_project_bundle_addon(
+            project_name,
+            addon_name,
+            variant=variant,
+        )
+
+        if is_project_bundle_addon:
+            raise BadRequestException(
+                "Cannot modify overrides when a project bundle is frozen. "
+                "Please unfreeze the bundle first."
+            )
+
     _ = await ProjectEntity.load(project_name)
 
     if not site_id:
@@ -304,6 +329,19 @@ async def modify_project_overrides(
     variant: str = Query("production"),
 ):
     # Project site settings
+
+    if variant in ("production", "staging") and site_id is None:
+        is_project_bundle_addon = await has_project_bundle_addon(
+            project_name,
+            addon_name,
+            variant=variant,
+        )
+
+        if is_project_bundle_addon:
+            raise BadRequestException(
+                "Cannot modify overrides when a project bundle is frozen. "
+                "Please unfreeze the bundle first."
+            )
 
     if site_id:
         if payload.action == "delete":
@@ -474,11 +512,10 @@ async def set_raw_addon_project_overrides(
             return EmptyResponse()
         original_data = res[0]["original_data"]
         updated_data = res[0]["updated_data"]
-        if ayonconfig.audit_trail:
-            payload = {
-                "originalValue": original_data or {},
-                "newValue": updated_data or {},
-            }
+        payload = {
+            "originalValue": original_data or {},
+            "newValue": updated_data or {},
+        }
 
         description = f"{addon_name} {addon_version} {variant} "
         description += "overrides changed using low-level API"

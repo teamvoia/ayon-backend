@@ -173,11 +173,6 @@ class AyonConfig(BaseModel):
         description="Disable REST API documentation",
     )
 
-    audit_trail: bool = Field(
-        default=True,
-        description="Enable audit trail",
-    )
-
     openapi_include_internal_endpoints: bool = Field(
         default=False,
         description="Include internal endpoints in the OpenAPI schema",
@@ -215,9 +210,13 @@ class AyonConfig(BaseModel):
         "to connect to external services",
     )
 
+    offline_mode: bool = Field(
+        False, description="Do not attempt to reach external services"
+    )
+
     ynput_cloud_api_url: str | None = Field(
-        "https://im.ynput.cloud",
-        description="YnputConnect URL",
+        "https://ynput.cloud",
+        description="Ynput Cloud URL",
     )
 
     disable_feedback: bool = Field(
@@ -274,6 +273,11 @@ class AyonConfig(BaseModel):
         description="Send saturated metrics to Ynput Cloud",
     )
 
+    metrics_disabled: bool = Field(
+        default=False,
+        description="Disable metrics collection and sending to Ynput Cloud",
+    )
+
     # Email settings
 
     email_from: str = Field("noreply@ynput.cloud", description="Email sender address")
@@ -306,6 +310,11 @@ class AyonConfig(BaseModel):
         description="Project files CDN resolver URL",
     )
 
+    thumbnail_size: int = Field(
+        default=500,
+        description="Max width/height of generated thumbnails in pixels",
+    )
+
     # Temporary / workarounds
 
     limit_user_visibility: bool = Field(
@@ -334,6 +343,17 @@ def load_config() -> AyonConfig:
 
         key = key.lower().removeprefix(prefix)
         if key in AyonConfig.__fields__:
+            # Replace deprecated endpoints
+
+            if key == "ynput_cloud_api_url" and value == "https://im.ynput.cloud":
+                value = "https://ynput.cloud"
+
+            if (
+                key == "default_project_storage_cdn_resolver"
+                and value == "https://im.ynput.cloud/api/v1/cdn"
+            ):
+                value = "https://ynput.cloud/api/ayon/cdn"
+
             env_data[key] = value
 
     config = AyonConfig(**env_data)

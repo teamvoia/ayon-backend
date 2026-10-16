@@ -5,7 +5,7 @@ from ayon_server.logging import logger
 
 # The following parameters may be used:
 # name, scope, type, title, default, example,
-# gt, lt, regex, min_len, max_len, description
+# gt, lt, regex, min_len, max_len, description, widget
 #
 # Scope and type are required.
 # All project attributes should have a default value
@@ -229,6 +229,7 @@ DEFAULT_ATTRIBUTES: dict[str, dict[str, Any]] = {
         "title": "Description",
         "description": "Textual description of the entity",
         "inherit": False,
+        "widget": "markdown",
     },
     "entityListCategory": {
         "scope": "L",
@@ -240,6 +241,9 @@ DEFAULT_ATTRIBUTES: dict[str, dict[str, Any]] = {
         "enum": [],
     },
 }
+
+# Fields of built-in attributes that users may change.
+USER_EDITABLE_FIELDS = ("title", "enum", "description")
 
 
 async def deploy_attributes() -> None:
@@ -293,6 +297,8 @@ async def deploy_attributes() -> None:
             "lt",
             "inherit",
             "enum",
+            "widget",
+            "widget_settings",
         ):
             if (value := tdata.get(key)) is not None:
                 data[key] = value
@@ -308,19 +314,20 @@ async def deploy_attributes() -> None:
                 position = EXCLUDED.position,
                 scope = EXCLUDED.scope,
                 builtin = EXCLUDED.builtin,
-                data = case
-                when $4->'enum' IS NULL then
-                    EXCLUDED.data
-                else
-                    EXCLUDED.data || jsonb_build_object(
-                        'enum', public.attributes.data->'enum'
-                    )
-                end
-
+                -- keep user-edited values of the preserved fields
+                data = EXCLUDED.data || coalesce(
+                    (
+                        SELECT jsonb_object_agg(key, value)
+                        FROM jsonb_each(public.attributes.data)
+                        WHERE key = ANY($5)
+                    ),
+                    '{}'::jsonb
+                )
             """,
             name,
             position,
             scope,
             data,
+            [k for k in USER_EDITABLE_FIELDS if k in data],
         )
         position += 1

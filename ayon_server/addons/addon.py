@@ -1,7 +1,7 @@
 import inspect
 import os
 
-from ayon_server.entities.user import UserEntity
+from ayon_server.auth.models import LoginResponseModel
 
 try:
     import toml
@@ -9,7 +9,10 @@ except ModuleNotFoundError:
     toml = None  # type: ignore
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
+
+from fastapi import Request
+from fastapi.responses import HTMLResponse
 
 from ayon_server.actions.config import get_action_config, set_action_config
 from ayon_server.actions.context import ActionContext
@@ -25,8 +28,14 @@ from ayon_server.addons.models import (
     SourceInfo,
     SSOOption,
 )
+from ayon_server.addons.openapi import get_addon_api_docs, get_addon_openapi
 from ayon_server.addons.settings_caching import AddonSettingsCache
-from ayon_server.exceptions import AyonException, BadRequestException, NotFoundException
+from ayon_server.entities.user import UserEntity
+from ayon_server.exceptions import (
+    AyonException,
+    BadRequestException,
+    NotFoundException,
+)
 from ayon_server.lib.postgres import Postgres
 from ayon_server.logging import log_traceback, logger
 from ayon_server.settings import BaseSettingsModel, apply_overrides
@@ -76,8 +85,8 @@ class BaseServerAddon:
     settings_model: type[BaseSettingsModel] | None = None
     site_settings_model: type[BaseSettingsModel] | None = None
     app_host_name: str | None = None
-    frontend_scopes: FrontendScopes = {}
-    frontend_modules: FrontendModules = {}
+    frontend_scopes: ClassVar[FrontendScopes] = {}
+    frontend_modules: ClassVar[FrontendModules] = {}
 
     compatibility: AddonCompatibilityModel | None = None
 
@@ -219,6 +228,12 @@ class BaseServerAddon:
                 "description": description or handler.__doc__ or "",
             }
         )
+
+    def get_openapi(self) -> dict[str, Any]:
+        return get_addon_openapi(self)
+
+    def get_api_docs(self) -> HTMLResponse:
+        return get_addon_api_docs(self)
 
     async def get_frontend_scopes(self) -> FrontendScopes:
         return self.frontend_scopes
@@ -615,7 +630,13 @@ class BaseServerAddon:
         Override this method to return the default settings for the addon.
         By default it returns defaults from the addon's settings model, but
         if you need to use a complex model or force required fields, you should
-        do something like: `return self.get_settings_model(**YOUR_ADDON_DEFAULTS)`.
+        do something like:
+
+        ```python
+                async def get_default_settings(self):
+                    settings_model_cls = self.get_settings_model()
+                    return settings_model_cls(**YOUR_ADDON_DEFAULTS)
+        ```
         """
 
         if (model := self.get_settings_model()) is None:
@@ -785,3 +806,16 @@ class BaseServerAddon:
         )
 
         return await get_action_config(config_hash)
+
+    async def authorize_public_link(
+        self,
+        token: str,
+        request: "Request",
+        current_user: UserEntity | None = None,
+    ) -> LoginResponseModel:
+        """Authorize a public link."""
+        from ayon_server.exceptions import NotImplementedException
+
+        raise NotImplementedException(
+            f"{self} addon does not support public link authentication"
+        )

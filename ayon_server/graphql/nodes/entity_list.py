@@ -1,12 +1,17 @@
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 import strawberry
 
+from ayon_server.activities.activity_categories import ActivityCategories
+from ayon_server.activities.guest_access import get_guest_activity_category
+from ayon_server.entities.project import ProjectEntity
 from ayon_server.entities.user import UserEntity
 from ayon_server.exceptions import AyonException, ForbiddenException
 from ayon_server.graphql.nodes.common import BaseNode
-from ayon_server.graphql.types import BaseConnection, BaseEdge, Info
+from ayon_server.graphql.resolvers.common import argdesc
+from ayon_server.graphql.resolvers.field_stats import MetricTargetInput
+from ayon_server.graphql.types import BaseConnection, BaseEdge, ColumnStats, Info
 from ayon_server.graphql.utils import process_attrib_data
 from ayon_server.helpers.entity_access import EntityAccessHelper
 from ayon_server.logging import logger
@@ -164,6 +169,7 @@ class EntityListItemEdge(BaseEdge):
 @strawberry.type
 class EntityListItemsConnection(BaseConnection):
     edges: list[EntityListItemEdge] = strawberry.field(default_factory=list)
+    field_stats: list[ColumnStats] = strawberry.field(default_factory=list)
 
 
 #
@@ -185,6 +191,8 @@ class EntityListNode:
     all_attrib: str = strawberry.field(default="{}")  # JSON string of all attrib keys
 
     tags: list[str] = strawberry.field(default_factory=list)
+
+    activity_categories: list[str] = strawberry.field(default_factory=list)
 
     owner: str | None = strawberry.field(default=None)
     active: bool = strawberry.field()
@@ -221,9 +229,19 @@ class EntityListNode:
         after: str | None = None,
         last: int | None = None,
         before: str | None = None,
-        sort_by: str | None = None,
+        sort_by: list[str] | None = None,
         accessible_only: bool = False,
         filter: str | None = None,
+        search: Annotated[str | None, argdesc("Fuzzy text search filter")] = None,
+        calculate_statistics: Annotated[
+            bool, argdesc("Whether to calculate column statistics")
+        ] = False,
+        calculate_specific_statistics: Annotated[
+            list[MetricTargetInput] | None,
+            argdesc(
+                "Map of attribute names to lists of desired statistical aggregations"
+            ),
+        ] = None,
     ) -> EntityListItemsConnection:
         if first is None and last is None:
             first = 200
@@ -238,7 +256,10 @@ class EntityListNode:
             before=before,
             sort_by=sort_by,
             filter=filter,
+            search=search,
             accessible_only=accessible_only,
+            calculate_statistics=calculate_statistics,
+            calculate_specific_statistics=calculate_specific_statistics,
         )
 
     @strawberry.field
@@ -262,25 +283,74 @@ class EntityListNode:
         return access_level
 
 
+async def get_activity_categories(
+    project: ProjectEntity,
+    user: UserEntity,
+    record: dict[str, Any],
+) -> list[str]:
+    writable_categories = await ActivityCategories.get_accessible_categories(
+        user,
+        project=project,
+        level=EntityAccessHelper.UPDATE,
+    )
+
+    if user.is_guest:
+        # Guests comment in the category set for them on the list
+        # (the same rules as when they comment, see post_project_activity)
+        category = await get_guest_activity_category(
+            user, project, record.get("id"), entity_list=record
+        )
+        if category not in writable_categories:
+            return []
+        return [category]
+
+    return writable_categories
+
+
 async def entity_list_from_record(
     project_name: str,
     record: dict[str, Any],
     context: dict[str, Any],
 ) -> EntityListNode:
-    data = record.get("data", {})
+    data = dict(record.get("data") or {})
     user = context.get("user")
+    project = context.get("project")
+
+    if not (user and project):
+        raise AyonException(
+            "User and project must be provided in context. This should not happen"
+        )
+
+    data.pop("publicLinks", None)  # Do not expose public links in GraphQL API
 
     entity_list_folder_id = record.get("entity_list_folder_id")
 
     if user:
-        await EntityAccessHelper.check(
-            user,
-            access=record.get("access"),
-            level=EntityAccessHelper.READ,
-            owner=record.get("owner"),
-            project=context.get("project"),
-            default_open=True,
-        )
+        if ga := user.get_guest_access(
+            project_name=project_name,
+            type="entityList",
+            id=record.get("id"),
+        ):
+            activity_category = ga.get("activityCategory")
+            activity_categories = [activity_category] if activity_category else []
+
+        else:
+            await EntityAccessHelper.check(
+                user,
+                access=record.get("access"),
+                level=EntityAccessHelper.READ,
+                owner=record.get("owner"),
+                project=context.get("project"),
+                default_open=True,
+            )
+
+            activity_categories = await get_activity_categories(project, user, record)
+
+    else:
+        activity_categories = []
+
+    if user.is_guest:
+        data = {}
 
     return EntityListNode(
         project_name=project_name,
@@ -294,6 +364,7 @@ async def entity_list_from_record(
         tags=record["tags"] or [],
         owner=record["owner"],
         active=record["active"],
+        activity_categories=activity_categories,
         created_at=record["created_at"],
         updated_at=record["updated_at"],
         created_by=record["created_by"],
