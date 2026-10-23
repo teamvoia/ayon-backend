@@ -2,12 +2,12 @@ import copy
 from typing import Any
 
 from fastapi import Query
-from pydantic.error_wrappers import ValidationError
+from pydantic import ValidationError
 
 from ayon_server.addons import AddonLibrary
 from ayon_server.api.dependencies import CurrentUser, ProjectName, SiteID
 from ayon_server.api.responses import EmptyResponse
-from ayon_server.config import ayonconfig
+from ayon_server.bundles.project_bundles import has_project_bundle_addon
 from ayon_server.entities import ProjectEntity
 from ayon_server.events import EventStream
 from ayon_server.exceptions import (
@@ -17,6 +17,7 @@ from ayon_server.exceptions import (
 )
 from ayon_server.lib.postgres import Postgres
 from ayon_server.logging import logger
+from ayon_server.models.field_info import format_validation_errors
 from ayon_server.settings import BaseSettingsModel
 from ayon_server.settings.overrides import extract_overrides, list_overrides
 from ayon_server.settings.postprocess import postprocess_settings_schema
@@ -60,7 +61,7 @@ async def get_addon_project_settings_schema(
         "user_name": user.name,
     }
 
-    schema = copy.deepcopy(model.schema())
+    schema = copy.deepcopy(model.model_json_schema())
     await postprocess_settings_schema(schema, model, context=context)
     schema["title"] = addon.friendly_name
     return schema
@@ -78,7 +79,7 @@ async def get_addon_project_settings(
     site_id: SiteID,
     variant: str = Query("production"),
     as_version: str | None = Query(None, alias="as"),
-) -> BaseSettingsModel:
+) -> dict[str, Any]:
     if (addon := AddonLibrary.addon(addon_name, version)) is None:
         raise NotFoundException(f"Addon {addon_name} {version} not found")
 
@@ -93,7 +94,7 @@ async def get_addon_project_settings(
 
     if not settings:
         raise NotFoundException(f"Settings for {addon_name} {version} not found")
-    return settings
+    return settings.model_dump(by_alias=True)
 
 
 @router.get("/{addon_name}/{version}/overrides/{project_name}")
@@ -191,22 +192,36 @@ async def set_addon_project_settings(
             write=True,
         )
 
-        original = await addon.get_project_settings(project_name, variant=variant)
-        existing = await addon.get_project_overrides(project_name, variant=variant)
+        is_project_bundle_addon = await has_project_bundle_addon(
+            project_name,
+            addon_name,
+            variant=variant,
+        )
 
-        if original is None:
-            # This addon does not have settings
-            raise BadRequestException(f"Addon {addon_name} has no settings")
-        try:
-            data = extract_overrides(
-                original,
-                model(**payload),
-                existing=existing,
-                explicit_pins=explicit_pins,
-                explicit_unpins=explicit_unpins,
-            )
-        except ValidationError as e:
-            raise BadRequestException("Invalid settings", errors=e.errors()) from e
+        if variant in ("production", "staging") and is_project_bundle_addon:
+            # If the addon uses a project bundle, we cannot process the overrides
+            # and we're storing the entire model
+            data = payload
+
+        else:
+            original = await addon.get_project_settings(project_name, variant=variant)
+            existing = await addon.get_project_overrides(project_name, variant=variant)
+
+            if original is None:
+                # This addon does not have settings
+                raise BadRequestException(f"Addon {addon_name} has no settings")
+            try:
+                data = extract_overrides(
+                    original,
+                    model(**payload),
+                    existing=existing,
+                    explicit_pins=explicit_pins,
+                    explicit_unpins=explicit_unpins,
+                )
+            except ValidationError as e:
+                raise BadRequestException(
+                    "Invalid settings", errors=format_validation_errors(e.errors())
+                ) from e
 
         await set_addon_settings(
             addon_name=addon_name,
@@ -259,6 +274,19 @@ async def delete_addon_project_overrides(
     site_id: SiteID,
     variant: str = Query("production"),
 ):
+    if variant in ("production", "staging") and site_id is None:
+        is_project_bundle_addon = await has_project_bundle_addon(
+            project_name,
+            addon_name,
+            variant=variant,
+        )
+
+        if is_project_bundle_addon:
+            raise BadRequestException(
+                "Cannot modify overrides when a project bundle is frozen. "
+                "Please unfreeze the bundle first."
+            )
+
     _ = await ProjectEntity.load(project_name)
 
     if not site_id:
@@ -304,6 +332,19 @@ async def modify_project_overrides(
     variant: str = Query("production"),
 ):
     # Project site settings
+
+    if variant in ("production", "staging") and site_id is None:
+        is_project_bundle_addon = await has_project_bundle_addon(
+            project_name,
+            addon_name,
+            variant=variant,
+        )
+
+        if is_project_bundle_addon:
+            raise BadRequestException(
+                "Cannot modify overrides when a project bundle is frozen. "
+                "Please unfreeze the bundle first."
+            )
 
     if site_id:
         if payload.action == "delete":
@@ -474,11 +515,10 @@ async def set_raw_addon_project_overrides(
             return EmptyResponse()
         original_data = res[0]["original_data"]
         updated_data = res[0]["updated_data"]
-        if ayonconfig.audit_trail:
-            payload = {
-                "originalValue": original_data or {},
-                "newValue": updated_data or {},
-            }
+        payload = {
+            "originalValue": original_data or {},
+            "newValue": updated_data or {},
+        }
 
         description = f"{addon_name} {addon_version} {variant} "
         description += "overrides changed using low-level API"

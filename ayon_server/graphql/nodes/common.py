@@ -1,20 +1,46 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 import strawberry
+from strawberry.scalars import JSON
 
 from ayon_server.entities import UserEntity
+from ayon_server.entities.core.attrib import ResolvedAttrib, resolve_attrib
 from ayon_server.exceptions import AyonException
 from ayon_server.graphql.connections import ActivitiesConnection
+from ayon_server.graphql.resolvers.common import ARGVisibility, EntityVisibility
 from ayon_server.graphql.types import BaseConnection, BaseEdge, Info
-from ayon_server.graphql.utils import process_attrib_data
+from ayon_server.graphql.utils import attrib_to_json, process_attrib_data
 from ayon_server.logging import logger
 from ayon_server.utils import json_dumps
+
+ATTRIB_DESCRIPTION = (
+    "Attribute values (JSON object). "
+    "Use the attributes endpoint to get the attribute definitions."
+)
+
+AttribNamesArgument = Annotated[
+    list[str] | None,
+    strawberry.argument(description="Return only the given attributes"),
+]
+
+LegacyAttribSelectionArgument = Annotated[
+    str | None,
+    strawberry.argument(
+        description=(
+            "Used internally for backwards compatibility: `attrib { a b: c }` "
+            'queries are rewritten to `attrib(legacySelection: "a b:c")`'
+        ),
+        deprecation_reason="Use `names` or select all attributes",
+    ),
+]
 
 
 @strawberry.type
 class ProductType(BaseEdge):
     name: str = strawberry.field()
+    # TODO remove 'icon' and 'color' for ayon_api compatibility
+    #     PR https://github.com/ynput/ayon-python-api/pull/332
     icon: str | None = strawberry.field(default=None)
     color: str | None = strawberry.field(default=None)
 
@@ -22,6 +48,48 @@ class ProductType(BaseEdge):
 @strawberry.type
 class ProductBaseType(BaseEdge):
     name: str = strawberry.field()
+    icon: str = strawberry.field()
+    color: str = strawberry.field()
+
+
+async def _get_entity(
+    info: Info, project_name: str, entity_type: str, entity_id: str
+) -> Optional["BaseNode"]:
+    if entity_type == "folder":
+        loader = info.context["folder_loader"]
+        parser = info.context["folder_from_record"]
+    elif entity_type == "version":
+        loader = info.context["version_loader"]
+        parser = info.context["version_from_record"]
+    elif entity_type == "product":
+        loader = info.context["product_loader"]
+        parser = info.context["product_from_record"]
+    elif entity_type == "task":
+        loader = info.context["task_loader"]
+        parser = info.context["task_from_record"]
+    elif entity_type == "representation":
+        loader = info.context["representation_loader"]
+        parser = info.context["representation_from_record"]
+    elif entity_type == "workfile":
+        loader = info.context["workfile_loader"]
+        parser = info.context["workfile_from_record"]
+    else:
+        msg = f"Unsupported entity type '{entity_type}' for link node"
+        logger.error(msg)
+        raise AyonException(msg)
+
+    record = await loader.load((project_name, entity_id))
+    if not record:
+        return None
+
+    entity_node = await parser(project_name, record, info.context)
+    access_checker = info.context.get("access_checker")
+    if access_checker:
+        entity_folder_path = (entity_node._folder_path or "").strip("/")
+        if not access_checker[entity_folder_path]:
+            # No access to the folder containing the linked entity
+            return None
+    return entity_node
 
 
 @strawberry.type
@@ -36,49 +104,64 @@ class LinkEdge(BaseEdge):
     description: str = strawberry.field(default="")
     author: str | None = strawberry.field(default=None)
     cursor: str | None = strawberry.field(default=None)
+    data: JSON = strawberry.field(default_factory=dict)
 
     @strawberry.field(description="Linked node")
     async def node(self, info: Info) -> Optional["BaseNode"]:
-        if self.entity_type == "folder":
-            loader = info.context["folder_loader"]
-            parser = info.context["folder_from_record"]
-        elif self.entity_type == "version":
-            loader = info.context["version_loader"]
-            parser = info.context["version_from_record"]
-        elif self.entity_type == "product":
-            loader = info.context["product_loader"]
-            parser = info.context["product_from_record"]
-        elif self.entity_type == "task":
-            loader = info.context["task_loader"]
-            parser = info.context["task_from_record"]
-        elif self.entity_type == "representation":
-            loader = info.context["representation_loader"]
-            parser = info.context["representation_from_record"]
-        elif self.entity_type == "workfile":
-            loader = info.context["workfile_loader"]
-            parser = info.context["workfile_from_record"]
-        else:
-            msg = f"Unsupported entity type '{self.entity_type}' for link node"
-            logger.error(msg)
-            raise AyonException(msg)
-
-        record = await loader.load((self.project_name, self.entity_id))
-        if not record:
-            return None
-
-        entity_node = await parser(self.project_name, record, info.context)
-        access_checker = info.context.get("access_checker")
-        if access_checker:
-            entity_folder_path = (entity_node._folder_path or "").strip("/")
-            if not access_checker[entity_folder_path]:
-                # No access to the folder containing the linked entity
-                return None
-        return entity_node
+        return await _get_entity(
+            info,
+            self.project_name,
+            self.entity_type,
+            self.entity_id,
+        )
 
 
 @strawberry.type
 class LinksConnection(BaseConnection):
     edges: list[LinkEdge] = strawberry.field(default_factory=list)
+
+
+@strawberry.type
+class ProjectLinkEdge(BaseEdge):
+    id: str = strawberry.field()
+    project_name: str = strawberry.field()
+
+    link_type: str = strawberry.field()
+
+    input_type: str = strawberry.field()
+    output_type: str = strawberry.field()
+    input_id: str = strawberry.field()
+    output_id: str = strawberry.field()
+
+    name: str | None = strawberry.field(default=None)
+    author: str | None = strawberry.field(default=None)
+    created_at: datetime = strawberry.field()
+
+    cursor: str | None = strawberry.field(default=None)
+    data: JSON = strawberry.field(default_factory=dict)
+
+    @strawberry.field(description="Input node")
+    async def input_node(self, info: Info) -> Optional["BaseNode"]:
+        return await _get_entity(
+            info,
+            self.project_name,
+            self.input_type,
+            self.input_id,
+        )
+
+    @strawberry.field(description="Output node")
+    async def output_node(self, info: Info) -> Optional["BaseNode"]:
+        return await _get_entity(
+            info,
+            self.project_name,
+            self.output_type,
+            self.output_id,
+        )
+
+
+@strawberry.type
+class ProjectLinksConnection(BaseConnection):
+    edges: list[ProjectLinkEdge] = strawberry.field(default_factory=list)
 
 
 @strawberry.type
@@ -89,9 +172,78 @@ class ThumbnailInfo:
     relation: str | None = strawberry.field(default=None)
 
 
-@strawberry.interface
-class BaseNode:
+@strawberry.type
+class AttribFields:
+    """`attrib` and `allAttrib` fields of the nodes having attributes.
+
+    The values are resolved the same way as in REST (see resolve_attrib)
+    and filtered by the permissions of the user. Subclasses provide
+    `entity_type`, `_attrib` (stored own values) and `_user`, project
+    nodes also `project_name`. Folders and tasks also provide
+    `_inherited_attrib` / `_project_attrib`.
+    """
+
     entity_type: strawberry.Private[str] = "unknown"
+    _attrib: strawberry.Private[dict[str, Any]]
+    _user: strawberry.Private[UserEntity]
+    _resolved_attrib: strawberry.Private[ResolvedAttrib | None] = None
+    _processed_attrib: strawberry.Private[dict[str, Any] | None] = None
+
+    def resolved_attrib(self) -> ResolvedAttrib:
+        """Attribute values resolved the same way as in REST (resolve_attrib)"""
+        if self._resolved_attrib is None:
+            self._resolved_attrib = resolve_attrib(
+                self.entity_type,
+                self._attrib,
+                inherited=getattr(self, "_inherited_attrib", None),
+                project=getattr(self, "_project_attrib", None),
+            )
+        return self._resolved_attrib
+
+    def processed_attrib(self) -> dict[str, Any]:
+        """Resolved attribute values the user can read."""
+        if self._processed_attrib is None:
+            self._processed_attrib = process_attrib_data(
+                self.resolved_attrib().values,
+                user=self._user,
+                project_name=getattr(self, "project_name", None),
+            )
+        return self._processed_attrib
+
+    @strawberry.field(description=ATTRIB_DESCRIPTION)
+    def attrib(
+        self,
+        names: AttribNamesArgument = None,
+        legacy_selection: LegacyAttribSelectionArgument = None,
+    ) -> JSON:
+        return JSON(
+            attrib_to_json(
+                self.entity_type,
+                self.processed_attrib(),
+                names=names,
+                legacy_selection=legacy_selection,
+            )
+        )
+
+    @strawberry.field
+    def all_attrib(self) -> str:
+        return json_dumps(self.processed_attrib())
+
+
+@strawberry.type
+class EntityListInfo:
+    id: str = strawberry.field()
+    label: str = strawberry.field()
+    entity_list_type: str = strawberry.field()
+    entity_type: str = strawberry.field()
+    active: bool = strawberry.field()
+    item_ids: list[str] = strawberry.field(
+        description="List items of the entity in this list, in list order"
+    )
+
+
+@strawberry.interface
+class BaseNode(AttribFields):
     project_name: str = strawberry.field()
 
     id: str = strawberry.field()
@@ -103,32 +255,6 @@ class BaseNode:
     updated_by: str | None = strawberry.field(default=None)
     created_at: datetime = strawberry.field()
     updated_at: datetime = strawberry.field()
-
-    _attrib: strawberry.Private[dict[str, Any]]
-    _user: strawberry.Private[UserEntity]
-    _processed_attrib: strawberry.Private[dict[str, Any] | None] = None
-
-    def processed_attrib(self) -> dict[str, Any]:
-        if self._processed_attrib is None:
-            inherited_attrib = (
-                self._inherited_attrib if hasattr(self, "_inherited_attrib") else None
-            )
-            project_attrib = (
-                self._project_attrib if hasattr(self, "_project_attrib") else None
-            )
-            return process_attrib_data(
-                self.entity_type,
-                self._attrib,
-                user=self._user,
-                project_name=self.project_name,
-                project_attrib=project_attrib,
-                inherited_attrib=inherited_attrib,
-            )
-        return self._processed_attrib
-
-    @strawberry.field
-    def all_attrib(self) -> str:
-        return json_dumps(self.processed_attrib())
 
     @strawberry.field
     async def links(
@@ -151,6 +277,21 @@ class BaseNode:
             name_ex=name_ex,
             first=first,
             after=after,
+        )
+
+    @strawberry.field(description="Entity lists containing this entity")
+    async def entity_lists(
+        self,
+        info: Info,
+        visibility: ARGVisibility = EntityVisibility.ALL,
+        entity_list_types: list[str] | None = None,
+    ) -> list[EntityListInfo]:
+        resolver = info.context["entity_lists_info_resolver"]
+        return await resolver(
+            root=self,
+            info=info,
+            visibility=visibility,
+            entity_list_types=entity_list_types,
         )
 
     @strawberry.field

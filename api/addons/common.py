@@ -2,7 +2,6 @@ from typing import Literal
 
 from ayon_server.addons import AddonLibrary
 from ayon_server.exceptions import NotFoundException
-from ayon_server.logging import log_traceback
 from ayon_server.settings import BaseSettingsModel
 from ayon_server.settings.set_addon_settings import set_addon_settings
 from ayon_server.types import Field, OPModel
@@ -32,11 +31,7 @@ async def remove_override(
     else:
         overrides = await addon.get_studio_overrides(variant=variant)
 
-    try:  # TODO: this try/block is probably no longer needed
-        dict_remove_path(overrides, path)
-    except KeyError:
-        log_traceback()
-        return
+    dict_remove_path(overrides, path)
 
     await set_addon_settings(
         addon_name,
@@ -73,7 +68,7 @@ async def pin_override(
     c_overr = overrides
 
     for key in path:
-        if key not in c_field.__fields__:
+        if key not in type(c_field).model_fields:
             raise KeyError(f"{key} is not present in {c_field}")
 
         c_field = getattr(c_field, key)
@@ -90,12 +85,12 @@ async def pin_override(
             continue
 
         if isinstance(c_field, BaseSettingsModel):
-            c_overr[key] = c_field.dict()
+            c_overr[key] = c_field.model_dump()
         elif isinstance(c_field, list):
             val = []
             for r in c_field:
                 if isinstance(r, BaseSettingsModel):
-                    val.append(r.dict())
+                    val.append(r.model_dump())
                 else:
                     val.append(r)
             c_overr[key] = val
@@ -131,11 +126,7 @@ async def remove_site_override(
 
     overrides = await addon.get_project_site_overrides(project_name, user_name, site_id)
 
-    try:  # TODO: this try/block is probably no longer needed
-        dict_remove_path(overrides, path)
-    except KeyError:
-        log_traceback()
-        return
+    dict_remove_path(overrides, path)
 
     await set_addon_settings(
         addon_name,
@@ -168,7 +159,7 @@ async def pin_site_override(
     c_overr = overrides
 
     for key in path:
-        if key not in c_field.__fields__:
+        if key not in type(c_field).model_fields:
             raise KeyError(f"{key} is not present in {c_field}")
 
         c_field = getattr(c_field, key)
@@ -185,12 +176,12 @@ async def pin_site_override(
             continue
 
         if isinstance(c_field, BaseSettingsModel):
-            c_overr[key] = c_field.dict()
+            c_overr[key] = c_field.model_dump()
         elif isinstance(c_field, list):
             val = []
             for r in c_field:
                 if isinstance(r, BaseSettingsModel):
-                    val.append(r.dict())
+                    val.append(r.model_dump())
                 else:
                     val.append(r)
             c_overr[key] = val

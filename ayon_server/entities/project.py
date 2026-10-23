@@ -6,10 +6,17 @@ folder_types of the project and the folder hierarchy.
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import aiofiles
 
 from ayon_server.entities.core import TopLevelEntity, attribute_library
 from ayon_server.entities.models import ModelSet
+from ayon_server.entities.models.project import (
+    ProjectModel,
+    ProjectPatchModel,
+    ProjectPostModel,
+)
 from ayon_server.entities.models.submodels import LinkTypeModel
 from ayon_server.entities.project_aux_tables import (
     FolderTypeDict,
@@ -24,23 +31,182 @@ from ayon_server.helpers.inherited_attributes import rebuild_inherited_attribute
 from ayon_server.helpers.project_list import build_project_list
 from ayon_server.lib.postgres import Postgres
 from ayon_server.lib.redis import Redis
-from ayon_server.utils import SQLTool, dict_exclude, get_nickname
+from ayon_server.logging import logger
+from ayon_server.utils import RequestCoalescer, SQLTool, get_nickname
+
+if TYPE_CHECKING:
+    from .project_skeleton import ProjectSkeletonEntity
 
 
-class ProjectEntity(TopLevelEntity):
+# Fields not stored in the projects table
+# (folder types, task types... are stored in the project schema)
+NOT_STORED_FIELDS = [
+    "folder_types",
+    "task_types",
+    "link_types",
+    "statuses",
+    "tags",
+    "skeleton",
+]
+
+
+async def ensure_required_project_link_types(
+    project_name: str,
+    link_types: list[dict[str, Any]],
+) -> bool:
+    """Ensure that the required link types exist in the project.
+
+    Creates any missing default link types in the database and appends
+    them to `link_types` in place, so the caller's already-built payload
+    (which holds the same list instance) picks up the new entries too.
+
+    Returns True if any link type was added, so callers that cache
+    `link_types` (e.g. as part of a larger payload) know they need to
+    refresh that cache.
+    """
+
+    from ayon_server.settings.anatomy.link_types import default_link_types
+
+    # identity is the (link_type, input_type, output_type) triple -
+    # `name` may differ and color/style ("data") is cosmetic
+    existing = {
+        (lt["link_type"], lt["input_type"], lt["output_type"]) for lt in link_types
+    }
+    added = False
+
+    for default_link_type in default_link_types:
+        candidate = LinkTypeModel(
+            name=default_link_type.name,
+            link_type=default_link_type.link_type,
+            input_type=default_link_type.input_type,
+            output_type=default_link_type.output_type,
+            data={"color": default_link_type.color, "style": default_link_type.style},
+        )
+        identity = (candidate.link_type, candidate.input_type, candidate.output_type)
+        if identity in existing:
+            continue
+
+        logger.debug(
+            f"Creating missing link type {candidate.name} in project {project_name}"
+        )
+
+        # `name` isn't guaranteed to match (link_type, input_type, output_type) -
+        # e.g. custom link types created via the enum "add new" flow can have an
+        # arbitrary name. The table also has a unique index on the
+        # (link_type, input_type, output_type) triple, so a conflict can occur
+        # on either constraint - omit the conflict target to catch both, then
+        # verify what's actually in the database before assuming the insert
+        # succeeded or the required link type is genuinely unavailable.
+        inserted = await Postgres.fetchrow(
+            f"""
+            INSERT INTO project_{project_name}.link_types
+                (name, link_type, input_type, output_type, data)
+            VALUES
+                ($1, $2, $3, $4, $5)
+            ON CONFLICT DO NOTHING
+            RETURNING name, link_type, input_type, output_type, data
+            """,
+            candidate.name,
+            candidate.link_type,
+            candidate.input_type,
+            candidate.output_type,
+            candidate.data,
+        )
+
+        if inserted is None:
+            # look up by identity only: if the triple exists (under any name),
+            # use it. Otherwise the conflict was on `name` alone.
+            existing_row = await Postgres.fetchrow(
+                f"""
+                SELECT name, link_type, input_type, output_type, data
+                FROM project_{project_name}.link_types
+                WHERE (link_type, input_type, output_type) = ($1, $2, $3)
+                """,
+                candidate.link_type,
+                candidate.input_type,
+                candidate.output_type,
+            )
+            if existing_row is None:
+                logger.warning(
+                    f"Cannot create required link type {candidate.name} in "
+                    f"project {project_name}: the name is used by a different "
+                    "link type"
+                )
+                continue
+
+            # the required triple already exists, just under a different
+            # name - reflect the row that's actually in the database
+            link_types.append(dict(existing_row))
+            added = True
+            continue
+
+        link_types.append(candidate.dict())
+        added = True
+
+    if added:
+        # invalidate the separate anatomy cache (helpers.anatomy.get_project_anatomy)
+        # so it doesn't keep serving the stale link types until its own TTL expires
+        await Redis.delete("project-anatomy", project_name)
+
+    return added
+
+
+class ProjectEntity(TopLevelEntity[ProjectModel]):
     entity_type: str = "project"
-    model: ModelSet = ModelSet("project", attribute_library["project"], False)
-    original_attributes: dict[str, Any] = {}
+    model = ModelSet(
+        "project",
+        ProjectModel,
+        ProjectPostModel,
+        ProjectPatchModel,
+        dynamic_fields=["skeleton"],
+    )
+    # Set per instance by _load(), used by _save() to detect attrib changes
+    original_attributes: dict[str, Any] | None = None
 
     #
     # Load
     #
 
     @classmethod
+    def return_project_skeleton(
+        cls, payload: dict[str, Any]
+    ) -> "ProjectSkeletonEntity":
+        from ayon_server.helpers.deploy_project import anatomy_to_project_data
+        from ayon_server.settings.anatomy import Anatomy
+
+        from .project_skeleton import ProjectSkeletonEntity
+
+        full_payload = dict(payload)
+
+        skeleton_anatomy = full_payload["data"].pop("skeletonAnatomy", None)
+        if skeleton_anatomy is None:
+            raise NotFoundException("Project skeleton anatomy not found")
+
+        full_payload.update(anatomy_to_project_data(Anatomy(**skeleton_anatomy)))
+        full_payload["skeleton"] = True
+        if "data" in full_payload:
+            full_payload["data"].pop("isSkeleton", None)
+
+        return ProjectSkeletonEntity.from_record(full_payload)
+
+    @classmethod
     async def load(
         cls,
         name: str,
-        transaction=None,  # deprecated
+        transaction: Any = None,  # deprecated
+        for_update: bool = False,
+    ) -> "ProjectEntity":
+        """Load a project from the database."""
+
+        if not for_update:
+            coalesce = RequestCoalescer()
+            return await coalesce(cls._load, name)
+        return await cls._load(name, for_update=for_update)
+
+    @classmethod
+    async def _load(
+        cls,
+        name: str,
         for_update: bool = False,
     ) -> "ProjectEntity":
         """Load a project from the database."""
@@ -54,12 +220,25 @@ class ProjectEntity(TopLevelEntity):
             if payload := await Redis.get_json("project-data", project_name):
                 if isinstance(payload, list):
                     payload = payload[0]
-                return cls.from_record(payload=payload)
+
+                if payload["data"].get("isSkeleton", False):
+                    return cls.return_project_skeleton(payload=payload)
+
+                if await ensure_required_project_link_types(
+                    project_name, payload["link_types"]
+                ):
+                    await Redis.set_json(
+                        "project-data", project_name, payload, ttl=3600
+                    )
+
+                project = cls.from_record(payload=payload)
+                project.original_attributes = payload["attrib"]
+                return project
 
         try:
             project_data = await Postgres.fetchrow(
                 f"""
-                SELECT  *
+                SELECT *
                 FROM public.projects
                 WHERE name ILIKE $1
                 {"FOR UPDATE NOWAIT" if for_update else ""}
@@ -69,6 +248,14 @@ class ProjectEntity(TopLevelEntity):
 
             if project_data is None:
                 raise NotFoundException(f"Project '{project_name}' not found")
+
+            project_data = dict(project_data)
+
+            if project_data["data"].get("isSkeleton", False):
+                await Redis.set_json(
+                    "project-data", project_name, project_data, ttl=3600
+                )
+                return cls.return_project_skeleton(payload=project_data)
 
             # Load folder types
             folder_types = []
@@ -144,23 +331,49 @@ class ProjectEntity(TopLevelEntity):
                 f"Project '{project_name}' is currently being modified"
             )
 
-        cls.original_attributes = project_data["attrib"]
-        await Redis.set_json("project-data", project_name, payload, ttl=3600)
-        return cls.from_record(payload=payload)
+        await ensure_required_project_link_types(project_name, link_types)
+
+        if for_update:
+            # we're inside the caller's transaction, which may still roll back
+            # (including the backfill above) - don't publish uncommitted data,
+            # just drop the cache and let the next regular load repopulate it
+            await Redis.delete("project-data", project_name)
+        else:
+            await Redis.set_json("project-data", project_name, payload, ttl=3600)
+        project = cls.from_record(payload=payload)
+        project.original_attributes = project_data["attrib"]
+        return project
 
     #
     # Save
     #
 
+    @classmethod
+    async def refresh_views(cls, **kwargs: Any) -> None:
+        await build_project_list()
+
+    async def commit(self):
+        """Post-update commit."""
+        await Redis.delete("project-anatomy", self.name)
+        await Redis.delete("project-data", self.name)
+        await self.refresh_views()
+
     async def save(self, *args, **kwargs) -> bool:
         """Save the project to the database."""
-        async with Postgres.transaction():
-            try:
-                return await self._save()
-            finally:
-                await Redis.delete("project-anatomy", self.name)
-                await Redis.delete("project-data", self.name)
-                await build_project_list()
+        # commit() must not run inside a failed transaction: it would hit
+        # InFailedSQLTransactionError and mask the original exception.
+        try:
+            async with Postgres.transaction():
+                result = await self._save()
+        except Exception:
+            for namespace in ("project-anatomy", "project-data"):
+                try:
+                    await Redis.delete(namespace, self.name)
+                except Exception:
+                    pass
+            raise
+        await self.commit()
+        return result
 
     async def _save(self) -> bool:
         assert self.folder_types, "Project must have at least one folder type"
@@ -171,20 +384,7 @@ class ProjectEntity(TopLevelEntity):
 
         project_name = self.name
         if self.exists:
-            fields = dict_exclude(
-                self.dict(exclude_none=True),
-                [
-                    "folder_types",
-                    "task_types",
-                    "link_types",
-                    "statuses",
-                    "tags",
-                    "created_at",
-                    "name",
-                    "own_attrib",
-                ],
-            )
-
+            fields = self.fields_to_save([*NOT_STORED_FIELDS, "created_at", "name"])
             fields["updated_at"] = datetime.now()
 
             await Postgres.execute(
@@ -197,30 +397,24 @@ class ProjectEntity(TopLevelEntity):
                 await rebuild_inherited_attributes(self.name, fields["attrib"])
 
         else:
-            # Create a project record
-            await Postgres.execute(
-                *SQLTool.insert(
-                    "projects",
-                    **dict_exclude(
-                        self.dict(exclude_none=True),
-                        [
-                            "folder_types",
-                            "task_types",
-                            "link_types",
-                            "statuses",
-                            "tags",
-                            "own_attrib",
-                        ],
-                    ),
-                )
-            )
+            # Create a project record. The project stores the attribute
+            # defaults as its own values (changing a default later
+            # does not affect existing projects)
+            fields = self.fields_to_save(NOT_STORED_FIELDS)
+            fields["attrib"] = {
+                **attribute_library.project_defaults,
+                **fields["attrib"],
+            }
+            await Postgres.execute(*SQLTool.insert("projects", **fields))
             # Create a new schema for the project tablespace
             await Postgres.execute(f"CREATE SCHEMA project_{project_name}")
 
             # Create tables in the newly created schema
             await Postgres.execute(f"SET LOCAL search_path TO project_{project_name}")
-            # TODO: Preload this to avoid blocking
-            await Postgres.execute(open("schemas/schema.project.sql").read())
+
+            async with aiofiles.open("schemas/schema.project.sql") as f:
+                schema_sql = await f.read()
+            await Postgres.execute(schema_sql)
 
         #
         # Save aux tables
@@ -248,17 +442,17 @@ class ProjectEntity(TopLevelEntity):
                     "DELETE FROM public.projects WHERE name = $1", self.name
                 )
             finally:
+                await Redis.delete("global", "project-list")
                 await Redis.delete("project-anatomy", self.name)
                 await Redis.delete("project-data", self.name)
                 await Redis.delete("project-folders", self.name)
-                await build_project_list()
         return True
 
     def as_user(self, user):
-        payload = self._payload.copy()
+        payload = self._payload.model_copy()
         if user.is_guest:
-            payload.data = {}  # type: ignore
-            payload.config = {}  # type: ignore
+            payload.data = {}
+            payload.config = {}
         return payload
 
     #
@@ -273,83 +467,98 @@ class ProjectEntity(TopLevelEntity):
     @property
     def code(self) -> str:
         """Get the project code."""
-        return self._payload.code  # type: ignore
+        return self._payload.code
 
     @code.setter
     def code(self, value: str) -> None:
         """Set the project code."""
-        self._payload.code = value  # type: ignore
+        self._payload.code = value
+
+    @property
+    def label(self) -> str | None:
+        """Get the project label."""
+        return self._payload.label
+
+    @label.setter
+    def label(self, value: str | None) -> None:
+        """Set the project label."""
+        self._payload.label = value
 
     @property
     def library(self) -> bool:
         """Return True if the entity is a library."""
-        return self._payload.library  # type: ignore
+        return self._payload.library
 
     @library.setter
     def library(self, value: bool) -> None:
         """Set the entity type to library."""
-        self._payload.library = value  # type: ignore
+        self._payload.library = value
 
     @property
     def config(self) -> dict[str, Any]:
         """Return the entity configuration."""
-        return self._payload.config  # type: ignore
+        return self._payload.config
 
     @config.setter
     def config(self, value: dict[str, Any]) -> None:
         """Set the entity configuration."""
-        self._payload.config = value  # type: ignore
+        self._payload.config = value
 
     # Project aux tables
 
     @property
     def folder_types(self) -> Sequence[FolderTypeDict]:
         """Return the folder types."""
-        return self._payload.folder_types  # type: ignore
+        return self._payload.folder_types
 
     @folder_types.setter
     def folder_types(self, value: Sequence[FolderTypeDict]) -> None:
         """Set the folder types."""
-        self._payload.folder_types = value  # type: ignore
+        self._payload.folder_types = list(value)
 
     @property
     def task_types(self) -> Sequence[TaskTypeDict]:
         """Return the task types."""
-        return self._payload.task_types  # type: ignore
+        return self._payload.task_types
 
     @task_types.setter
     def task_types(self, value: Sequence[TaskTypeDict]) -> None:
         """Set the task types."""
-        self._payload.task_types = value  # type: ignore
+        self._payload.task_types = list(value)
 
     @property
     def statuses(self) -> Sequence[StatusTypeDict]:
         """Return the statuses."""
-        return self._payload.statuses  # type: ignore
+        return self._payload.statuses
 
     @statuses.setter
     def statuses(self, value: Sequence[StatusTypeDict]) -> None:
         """Set the statuses."""
-        self._payload.statuses = value  # type: ignore
+        self._payload.statuses = list(value)
 
     @property
     def tags(self) -> Sequence[TagTypeDict]:
         """Return the tags."""
-        return self._payload.tags  # type: ignore
+        return self._payload.tags
 
     @tags.setter
     def tags(self, value: Sequence[TagTypeDict]) -> None:
         """Set the tags."""
-        self._payload.tags = value  # type: ignore
+        self._payload.tags = list(value)
 
     # Link types. Black sheep of aux tables
 
     @property
     def link_types(self) -> Sequence[LinkTypeModel]:
         """Return the link types."""
-        return self._payload.link_types  # type: ignore
+        return self._payload.link_types
 
     @link_types.setter
-    def link_types(self, value: list[dict[str, Any]]) -> None:
+    def link_types(self, value: list[LinkTypeModel]) -> None:
         """Set the link types."""
-        self._payload.link_types = value  # type: ignore
+        self._payload.link_types = value
+
+    @property
+    def skeleton(self) -> bool:
+        """Return True if the project is a skeleton."""
+        return False

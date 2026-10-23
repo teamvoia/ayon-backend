@@ -1,12 +1,18 @@
 from datetime import datetime
 from typing import Any
 
-from ayon_server.access.utils import ensure_entity_access
-from ayon_server.entities.core import ProjectLevelEntity, attribute_library
+from ayon_server.access.utils import ensure_entity_access, folder_access_list
+from ayon_server.entities.core import ProjectLevelEntity
 from ayon_server.entities.models import ModelSet
+from ayon_server.entities.models.folder import (
+    FolderModel,
+    FolderPatchModel,
+    FolderPostModel,
+)
 from ayon_server.exceptions import (
     AyonException,
     ForbiddenException,
+    NotFoundException,
 )
 from ayon_server.helpers.hierarchy_cache import rebuild_hierarchy_cache
 from ayon_server.helpers.inherited_attributes import rebuild_inherited_attributes
@@ -70,9 +76,15 @@ BASE_GET_QUERY = """
 """
 
 
-class FolderEntity(ProjectLevelEntity):
+class FolderEntity(ProjectLevelEntity[FolderModel]):
     entity_type: ProjectLevelEntityType = "folder"
-    model: ModelSet = ModelSet("folder", attribute_library["folder"])
+    model = ModelSet(
+        "folder",
+        FolderModel,
+        FolderPostModel,
+        FolderPatchModel,
+        dynamic_fields=["path", "has_versions"],
+    )
     base_get_query = BASE_GET_QUERY
 
     @staticmethod
@@ -81,27 +93,15 @@ class FolderEntity(ProjectLevelEntity):
         if path is not None:
             # ensure path starts with / but does not end with /
             record["path"] = f"/{path.strip('/')}"
-        attrib: dict[str, Any] = {}
-        inherited_attrib: dict[str, Any] = {}
-
-        for key, value in record.get("project_attrib", {}).items():
-            if key in attribute_library.inheritable_attributes():
-                attrib[key] = value
-                inherited_attrib[key] = value
-
-        if (ia := record["inherited_attrib"]) is not None:
-            for key, value in ia.items():
-                if key in attribute_library.inheritable_attributes():
-                    attrib[key] = value
-                    inherited_attrib[key] = value
-
-        elif record["parent_id"] is not None:
+        # `attrib` holds the own values, `inherited_attrib` the exported
+        # attributes of the parent and `project_attrib` the project values.
+        # The attribute values are resolved from them (see resolve_attrib)
+        if record["inherited_attrib"] is None and record["parent_id"] is not None:
             logger.warning(
                 f"Folder {record['path']} does not have inherited attributes."
                 "this shouldn't happen"
             )
-        attrib.update(record["attrib"])
-        return {**record, "attrib": attrib, "inherited_attrib": inherited_attrib}
+        return record
 
     async def save(self, *args, auto_commit: bool = True, **kwargs) -> None:
         async with Postgres.transaction():
@@ -119,12 +119,7 @@ class FolderEntity(ProjectLevelEntity):
                     raise AyonException("No folder types defined")
                 self.folder_type = res[0]["name"]
 
-            attrib = {}
-            for key in self.own_attrib:
-                if not hasattr(self.attrib, key):
-                    continue
-                if (value := getattr(self.attrib, key)) is not None:
-                    attrib[key] = value
+            attrib = self.own_attrib_to_save()
 
             if self.exists:
                 # Update existing entity
@@ -161,6 +156,7 @@ class FolderEntity(ProjectLevelEntity):
 
             # This needs to run in save, not in refresh_views, because
             # we may need the hierarchy record in the same transaction
+            logger.trace(f"Refreshing {self.project_name} hierarchy")
             await Postgres.execute(
                 f"""
                 REFRESH MATERIALIZED VIEW
@@ -169,10 +165,10 @@ class FolderEntity(ProjectLevelEntity):
             )
 
             if auto_commit:
-                await self.commit()
+                await self.commit(refresh_hierarchy=False)  # already refreshed
 
     @classmethod
-    async def refresh_views(cls, project_name: str) -> None:
+    async def refresh_views(cls, project_name: str, **kwargs) -> None:
         """Refresh hierarchy materialized view on folder save."""
         logger.trace(f"Refreshing folder views for project {project_name}")
 
@@ -186,7 +182,11 @@ class FolderEntity(ProjectLevelEntity):
         #  - caches the hierarchy table in Redis
         #  - which depends on the exported_attributes table
 
-        await rebuild_inherited_attributes(project_name)
+        refresh_hierarchy = kwargs.get("refresh_hierarchy", True)
+        await rebuild_inherited_attributes(
+            project_name,
+            refresh_hierarchy=refresh_hierarchy,
+        )
         await rebuild_hierarchy_cache(project_name)
 
     async def delete(self, *args, auto_commit: bool = True, **kwargs) -> bool:
@@ -202,15 +202,9 @@ class FolderEntity(ProjectLevelEntity):
                         OR path LIKE $1 || '/%'
                     ) RETURNING name
                     """,
-                    self.path.lstrip("/"),
+                    (self.path or "").lstrip("/"),
                 )
-
-            res = await super().delete()
-            if not res:
-                return False
-            elif auto_commit:
-                await self.commit()
-        return res
+            return await super().delete(*args, auto_commit=auto_commit, **kwargs)
 
     async def get_versions(self) -> list[str]:
         """Return of version ids associated with this folder."""
@@ -230,25 +224,52 @@ class FolderEntity(ProjectLevelEntity):
         """Check if the user has access to create a new entity.
 
         Raises FobiddenException if the user does not have access.
-        Reimplements the method from the parent class, because in
-        case of folders we need to check the parent folder.
+        Managers and users without restricted folder creation can create
+        folders anywhere. Otherwise, the path of the new folder
+        (parent path + name) must be whitelisted in the create access list.
         """
-        try:
-            if self.parent_id is None:
-                # if user can create a project, they can create a root folders
-                user.check_permissions("studio.create_projects")
-        except ForbiddenException:
-            pass
-        else:
+
+        if user.is_manager:
             return
 
-        await ensure_entity_access(
-            user,
-            self.project_name,
-            self.entity_type,
-            self.parent_id,
-            "create",
-        )
+        if not user.permissions(self.project_name).create.enabled:
+            return
+
+        if self.parent_id is None:
+            try:
+                # if user can create a project, they can create root folders
+                user.check_permissions("studio.create_projects")
+            except ForbiddenException:
+                pass
+            else:
+                return
+            target_path = self.name
+
+        else:
+            res = await Postgres.fetchrow(
+                f"""
+                SELECT path FROM project_{self.project_name}.hierarchy
+                WHERE id = $1
+                """,
+                self.parent_id,
+            )
+            if res is None:
+                raise NotFoundException(f"Parent folder {self.parent_id} not found")
+            target_path = f"{res['path'].strip('/')}/{self.name}"
+
+        access_list = await folder_access_list(user, self.project_name, "create")
+        if access_list is None:
+            return
+
+        for path in access_list:
+            path = path.strip('"')
+            if path.endswith("/%"):
+                if target_path.startswith(path[:-1]):
+                    return
+            elif target_path == path:
+                return
+
+        raise ForbiddenException(f"You are not allowed to create folder {target_path}")
 
     async def ensure_update_access(self, user, **kwargs) -> None:
         """Check if the user has access to update the folder.
@@ -303,50 +324,50 @@ class FolderEntity(ProjectLevelEntity):
     @property
     def label(self) -> str | None:
         """Return the label of the folder."""
-        return self._payload.label  # type: ignore
+        return self._payload.label
 
     @label.setter
     def label(self, value):
         """Set the label of the folder."""
-        self._payload.label = value  # type: ignore
+        self._payload.label = value
 
     @property
     def parent_id(self) -> str | None:
-        return self._payload.parent_id  # type: ignore
+        return self._payload.parent_id
 
     @parent_id.setter
     def parent_id(self, value: str) -> None:
-        self._payload.parent_id = value  # type: ignore
+        self._payload.parent_id = value
 
     @property
     def folder_type(self) -> str | None:
-        return self._payload.folder_type  # type: ignore
+        return self._payload.folder_type
 
     @folder_type.setter
     def folder_type(self, value: str) -> None:
-        self._payload.folder_type = value  # type: ignore
+        self._payload.folder_type = value
 
     @property
     def thumbnail_id(self) -> str | None:
-        return self._payload.thumbnail_id  # type: ignore
+        return self._payload.thumbnail_id
 
     @thumbnail_id.setter
     def thumbnail_id(self, value: str) -> None:
-        self._payload.thumbnail_id = value  # type: ignore
+        self._payload.thumbnail_id = value
 
     #
     # Read only properties
     #
 
     @property
-    def path(self) -> str:
-        return self._payload.path  # type: ignore
+    def path(self) -> str | None:
+        return self._payload.path
 
     @property
     def entity_subtype(self) -> str | None:
         return self.folder_type
 
     @property
-    def has_versions(self) -> bool:
+    def has_versions(self) -> bool | None:
         """Check if the folder has any versions."""
-        return self._payload.has_versions  # type: ignore
+        return self._payload.has_versions
