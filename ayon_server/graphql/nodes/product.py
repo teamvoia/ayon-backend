@@ -1,10 +1,8 @@
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
 
-from ayon_server.entities import ProductEntity
 from ayon_server.graphql.nodes.common import BaseNode
 from ayon_server.graphql.resolvers.versions import get_versions
 from ayon_server.graphql.types import Info
@@ -15,9 +13,11 @@ if TYPE_CHECKING:
     from ayon_server.graphql.nodes.folder import FolderNode
     from ayon_server.graphql.nodes.version import VersionNode
 else:
-    FolderNode = LazyType["FolderNode", ".folder"]
-    VersionNode = LazyType["VersionNode", ".version"]
-    VersionsConnection = LazyType["VersionsConnection", "..connections"]
+    VersionsConnection = Annotated[
+        "VersionsConnection", strawberry.lazy("..connections")
+    ]
+    FolderNode = Annotated["FolderNode", strawberry.lazy(".folder")]
+    VersionNode = Annotated["VersionNode", strawberry.lazy(".version")]
 
 
 @strawberry.type
@@ -32,11 +32,6 @@ class VersionListItem:
             return "HERO"
         # TODO: configurable zero pad / format?
         return f"v{self.version:03d}"
-
-
-@ProductEntity.strawberry_attrib()
-class ProductAttribType:
-    pass
 
 
 @strawberry.type
@@ -73,7 +68,7 @@ class ProductNode(BaseNode):
         description="Simple (id /version) list of versions in the product",
     )
 
-    _folder: FolderNode | None = None
+    _folder: strawberry.Private[FolderNode | None] = None
 
     @strawberry.field(description="Parent folder of the product")
     async def folder(self, info: Info) -> FolderNode:
@@ -98,10 +93,6 @@ class ProductNode(BaseNode):
         return await info.context["version_from_record"](
             self.project_name, record, info.context
         )
-
-    @strawberry.field
-    def attrib(self) -> ProductAttribType:
-        return ProductAttribType(**self.processed_attrib())
 
     @strawberry.field()
     def parents(self) -> list[str]:
@@ -144,12 +135,16 @@ class ProductNode(BaseNode):
 
             data["_folder_path"] = self._folder_path
             data["_product_name"] = self.name
-            data["id"] = data["id"].replace("-", "")
-            data["hero_version_id"] = (
-                data["hero_version_id"].replace("-", "")
-                if data.get("hero_version_id")
-                else None
-            )
+            # to_jsonb keeps uuid dashes, loaders expect them stripped
+            for key in (
+                "id",
+                "hero_version_id",
+                "product_id",
+                "task_id",
+                "thumbnail_id",
+            ):
+                if data.get(key):
+                    data[key] = data[key].replace("-", "")
             data["created_at"] = datetime.fromisoformat(data["created_at"])
             data["updated_at"] = datetime.fromisoformat(data["updated_at"])
 

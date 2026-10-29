@@ -3,8 +3,10 @@ import traceback
 from typing import Any
 
 import strawberry
+from fastapi import Request
 from graphql import GraphQLError
 from strawberry.dataloader import DataLoader
+from strawberry.extensions import SchemaExtension
 from strawberry.fastapi import GraphQLRouter
 from strawberry.types import ExecutionContext
 
@@ -27,6 +29,12 @@ from ayon_server.graphql.dataloaders import (
     version_loader,
     workfile_loader,
 )
+from ayon_server.graphql.dataloaders.entity_lists import (
+    entity_lists_by_entity_loader,
+    get_entity_lists_info,
+)
+from ayon_server.graphql.legacy_attrib import LegacyAttribSelection
+from ayon_server.graphql.legacy_sort_by import LegacySortByVariables
 from ayon_server.graphql.nodes.common import ProductType
 from ayon_server.graphql.nodes.entity_list import entity_list_from_record
 from ayon_server.graphql.nodes.folder import folder_from_record
@@ -51,10 +59,11 @@ from ayon_server.logging import logger
 from ayon_server.utils import json_dumps
 
 
-async def graphql_get_context(user: CurrentUser) -> dict[str, Any]:
+async def graphql_get_context(request: Request, user: CurrentUser) -> dict[str, Any]:
     """Get the current request context"""
     return {
         # Auth
+        "request": request,
         "user": user,
         # Record parsing
         "entity_list_from_record": entity_list_from_record,
@@ -75,10 +84,14 @@ async def graphql_get_context(user: CurrentUser) -> dict[str, Any]:
         "user_loader": DataLoader(load_fn=user_loader),
         "workfile_loader": DataLoader(load_fn=workfile_loader),
         "representation_loader": DataLoader(load_fn=representation_loader),
+        "entity_lists_by_entity_loader": DataLoader(
+            load_fn=entity_lists_by_entity_loader
+        ),
         # Other
         "activities_resolver": get_activities,
         "links_resolver": get_links,
         "entity_list_items_resolver": get_entity_list_items,
+        "entity_lists_info_resolver": get_entity_lists_info,
     }
 
 
@@ -134,12 +147,13 @@ class Query:
             active=user.active,
             updated_at=user.updated_at,
             created_at=user.created_at,
-            _attrib=user.attrib.dict(),
+            _attrib=user.attrib.model_dump(),
             access_groups=json_dumps(user.data.get("accessGroups", {})),
             is_admin=user.is_admin,
             is_manager=user.is_manager,
             is_service=user.is_service,
             is_developer=user.is_developer,
+            is_staging_allowed=user.data.get("isStagingEnabled", False),
             is_guest=user.is_guest,
             user_pool=user.data.get("userPool"),
             default_access_groups=user.data.get("defaultAccessGroups", []),
@@ -221,8 +235,24 @@ class AyonSchema(strawberry.Schema):
             )
 
 
+class QueryNameExtension(SchemaExtension):
+    def on_operation(self):
+        execution_context = self.execution_context
+        request = execution_context.context.get("request")
+        if request and execution_context.operation_name:
+            request.state.graphql_query = execution_context.operation_name
+        yield
+
+
 router: GraphQLRouter[Any, Any] = GraphQLRouter(
-    schema=AyonSchema(query=Query),
-    graphiql=False,
+    schema=AyonSchema(
+        query=Query,
+        extensions=[
+            LegacyAttribSelection,
+            LegacySortByVariables,
+            QueryNameExtension,
+        ],
+    ),
+    graphql_ide=None,
     context_getter=graphql_get_context,
 )

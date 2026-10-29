@@ -9,6 +9,9 @@ from ayon_server.config.serverconfig import get_server_config as _get_server_con
 from ayon_server.config.serverconfig import (
     get_server_config_overrides as _get_server_config_overrides,
 )
+from ayon_server.config.serverconfig import (
+    update_server_config as _update_server_config,
+)
 from ayon_server.exceptions import BadRequestException, ForbiddenException
 from ayon_server.settings.overrides import extract_overrides, list_overrides
 from ayon_server.settings.postprocess import postprocess_settings_schema
@@ -18,7 +21,7 @@ from .router import router
 
 @router.get("/config/schema")
 async def get_server_config_schema(_: CurrentUserOptional) -> dict[str, Any]:
-    schema = ServerConfigModel.schema()
+    schema = ServerConfigModel.model_json_schema()
     await postprocess_settings_schema(schema, ServerConfigModel)
     schema["title"] = "Server Configuration"
     return schema
@@ -73,7 +76,7 @@ async def get_config_value(
     key: str = Path(..., description="The key of the configuration value to retrieve"),
 ) -> Any:
     config = await _get_server_config()
-    config_dict = config.dict()
+    config_dict = config.model_dump()
 
     try:
         value = config_dict[key]
@@ -89,3 +92,17 @@ async def get_config_value(
         )
 
     return value
+
+
+@router.patch("/config", status_code=204)
+async def update_server_config(
+    user: CurrentUser,
+    payload: dict[str, Any],
+) -> None:
+    """Update the server configuration with the provided values"""
+
+    if not user.is_admin:
+        msg = "Only administrators can change the server configuration"
+        raise ForbiddenException(msg)
+
+    await _update_server_config(payload)

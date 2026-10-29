@@ -2,16 +2,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 import aiocache
-from attributes.attributes import AttributeModel  # type: ignore
+from attributes.attributes import list_attributes  # type: ignore
 from fastapi import Query, Request
-from pydantic import ValidationError
 
 from ayon_server.addons import AddonLibrary, SSOOption
 from ayon_server.api.dependencies import AllowGuests, CurrentUserOptional, NoTraces
+from ayon_server.attributes.models import AttributeModel
 from ayon_server.config import ayonconfig
 from ayon_server.config.serverconfig import get_server_config
-from ayon_server.entities import UserEntity
-from ayon_server.entities.core.attrib import attribute_library
+from ayon_server.entities.models.user import UserModel
 from ayon_server.helpers.cloud import CloudUtils
 from ayon_server.helpers.email import is_mailing_enabled
 from ayon_server.info import ReleaseInfo, get_release_info, get_uptime, get_version
@@ -38,6 +37,12 @@ class InfoResponseModel(OPModel):
         example="https://i.insider.com/602ee9d81a89f20019a377c6?width=1136&format=jpeg",
     )
     login_page_brand: str | None = Field(
+        None,
+        title="Brand logo",
+        description="Replaced by `studio_logo`, kept for backward compatibility",
+        deprecated=True,
+    )
+    studio_logo: str | None = Field(
         None,
         title="Brand logo",
         description="URL of the brand logo for the login page",
@@ -67,12 +72,6 @@ class InfoResponseModel(OPModel):
         title="Onboarding",
     )
 
-    disable_changelog: bool | None = Field(
-        None,
-        title="Disable changelog",
-        description="If set, the changelog will not be shown to the user",
-    )
-
     hide_password_auth: bool | None = Field(
         None,
         title="Hide password authentication",
@@ -80,13 +79,34 @@ class InfoResponseModel(OPModel):
     )
 
     password_recovery_available: bool | None = Field(None, title="Password recovery")
-    user: UserEntity.model.main_model | None = Field(None, title="User information")  # type: ignore
-    attributes: list[AttributeModel] | None = Field(None, title="List of attributes")
+    user: UserModel | None = Field(None, title="User information")
+    attributes: list[AttributeModel] | None = Field(
+        None,
+        title="List of attributes",
+        description="Deprecated. Use the `/api/attributes` endpoint instead.",
+        deprecated=True,
+    )
 
     sites: list[SiteInfo] | None = Field(None, title="List of sites")
     sso_options: list[SSOOption] | None = Field(None, title="SSO options")
     frontend_flags: list[str] | None = Field(None, title="Frontend flags")
     extras: str | None = Field(None)
+
+    disable_changelog: bool | None = Field(
+        None,
+        title="Disable changelog",
+        description="If set, the changelog will not be shown to the user",
+    )
+    disable_feedback: bool | None = Field(
+        title="Disable feedback",
+        default_factory=lambda: (
+            ayonconfig.offline_mode or ayonconfig.disable_feedback or None
+        ),
+    )
+    offline_mode: bool | None = Field(
+        title="Offline mode",
+        default_factory=lambda: ayonconfig.offline_mode or None,
+    )
 
 
 # Get all SSO options from the active addons
@@ -177,7 +197,7 @@ async def get_user_sites(
         # or has been changed, upsert it
         if current_needs_update or not current_site_exists:
             logger.debug(f"Registering to site {current_site.id}")
-            mdata = current_site.dict()
+            mdata = current_site.model_dump()
             mid = mdata.pop("id")
             await Postgres.execute(
                 """
@@ -192,33 +212,6 @@ async def get_user_sites(
         # insert the current site at the beginning of the list
         sites.insert(0, current_site)
     return sites
-
-
-@aiocache.cached(ttl=5)
-async def get_attributes() -> list[AttributeModel]:
-    """Return a list of available attributes
-
-    populate enum fields with values from the database
-    in the case dynamic enums are used.
-    """
-
-    enums: dict[str, Any] = {}
-    async for row in Postgres.iterate(
-        "SELECT name, data FROM attributes WHERE data->'enum' is not null"
-    ):
-        enums[row["name"]] = row["data"]["enum"]
-
-    attr_list: list[AttributeModel] = []
-    for row in attribute_library.info_data:
-        row = {**row}
-        if row["name"] in enums:
-            row["data"]["enum"] = enums[row["name"]]
-        try:
-            attr_list.append(AttributeModel(**row))
-        except ValidationError:
-            log_traceback(f"Invalid attribute data: {row}")
-            continue
-    return attr_list
 
 
 async def get_additional_info(
@@ -251,28 +244,25 @@ async def get_additional_info(
     if not is_guest:
         sites = await get_user_sites(user_name, current_site)
 
-    attr_list = await get_attributes()
+    attr_list = list_attributes()
     extras = await CloudUtils.get_extras()
 
     return {
         "attributes": attr_list,
         "sites": sites,
         "extras": extras,
-        "disable_changelog": not (
-            is_admin or server_config.changelog.show_changelog_to_users
-        ),
+        "disable_changelog": ayonconfig.offline_mode
+        or ayonconfig.disable_feedback
+        or not (is_admin or server_config.changelog.show_changelog_to_users),
     }
 
 
+@Redis.cached("global", "onboardingFinished")
 async def is_onboarding_finished() -> bool:
-    r = await Redis.get("global", "onboardingFinished")
-    if r is None:
-        query = "SELECT * FROM config where key = 'onboardingFinished'"
-        rdb = await Postgres.fetch(query)
-        if rdb:
-            await Redis.set("global", "onboardingFinished", "1")
-            return True
-    elif r:
+    """Check if the onboarding process has been finished"""
+    query = "SELECT * FROM config where key = 'onboardingFinished'"
+    rdb = await Postgres.fetch(query)
+    if rdb:
         return True
     return False
 
@@ -311,7 +301,6 @@ async def get_site_info(
         site_platform = request.headers.get("x-ayon-platform")
         site_hostname = request.headers.get("x-ayon-hostname")
         site_version = request.headers.get("x-ayon-version")
-        sso_options = await get_sso_options(request)
         frontend_flags = server_config.customization.frontend_flags
 
         additional_info = await coalesce(
@@ -325,46 +314,53 @@ async def get_site_info(
             site_version,
         )
 
-        additional_info["sso_options"] = sso_options
         additional_info["frontend_flags"] = frontend_flags
 
         if current_user.is_admin and not current_user.is_service:
             if not await is_onboarding_finished():
                 additional_info["onboarding"] = True
-    elif full:
-        has_admin_user = await CloudUtils.get_admin_exists()
-        sso_options = await get_sso_options(request)
-        additional_info = {
-            "sso_options": sso_options,
-            "no_admin_user": (not has_admin_user) or None,
-            "password_recovery_available": bool(await is_mailing_enabled()),
-        }
+
+    if full:
         customization = server_config.customization
+        sso_options = await get_sso_options(request)
 
-        if customization.motd:
-            additional_info["motd"] = customization.motd
-        elif ayonconfig.motd:  # Deprecated
-            additional_info["motd"] = ayonconfig.motd
+        if not current_user:
+            has_admin_user = await CloudUtils.get_admin_exists()
+            additional_info["no_admin_user"] = (not has_admin_user) or None
+            additional_info["password_recovery_available"] = bool(
+                await is_mailing_enabled()
+            )
 
-        if customization.login_background:
-            url = f"/static/customization/{customization.login_background}"
-            additional_info["login_page_background"] = url
-        elif ayonconfig.login_page_background:  # Deprecated
-            additional_info["login_page_background"] = ayonconfig.login_page_background
+            if customization.motd:
+                additional_info["motd"] = customization.motd
+            elif ayonconfig.motd:  # Deprecated
+                additional_info["motd"] = ayonconfig.motd
+
+            if customization.login_background:
+                url = f"/static/customization/{customization.login_background}"
+                additional_info["login_page_background"] = url
+            elif ayonconfig.login_page_background:  # Deprecated
+                additional_info["login_page_background"] = (
+                    ayonconfig.login_page_background
+                )
+
+            if server_config.authentication.hide_password_auth:
+                additional_info["hide_password_auth"] = True
+
+        additional_info["sso_options"] = sso_options
 
         if customization.studio_logo:
             url = f"/static/customization/{customization.studio_logo}"
             additional_info["login_page_brand"] = url
+            additional_info["studio_logo"] = url
         elif ayonconfig.login_page_brand:  # Deprecated
             additional_info["login_page_brand"] = ayonconfig.login_page_brand
-
-        if server_config.authentication.hide_password_auth:
-            additional_info["hide_password_auth"] = True
+            additional_info["studio_logo"] = ayonconfig.login_page_brand
 
     user_payload = None
     if current_user:
         user_payload = current_user.payload
         if not current_user.is_service:
-            user_payload.ui_exposure_level = await current_user.get_ui_exposure_level()  # type: ignore
+            user_payload.ui_exposure_level = await current_user.get_ui_exposure_level()
 
     return InfoResponseModel(user=user_payload, **additional_info)

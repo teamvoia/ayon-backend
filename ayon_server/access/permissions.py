@@ -1,7 +1,7 @@
 from typing import Any
 
 import aiocache
-from pydantic import validator
+from pydantic import ValidationInfo, field_validator
 
 from ayon_server.enum import EnumRegistry
 from ayon_server.enum.enum_item import EnumItem
@@ -30,7 +30,16 @@ def _top_level_fields_enum() -> list[dict[str, str]]:
         {"value": "folder_id", "label": "Move task"},
         {"value": "task_type", "label": "Change task type"},
         {"value": "assignees", "label": "Change task assignees"},
+        {"value": "product_base_type", "label": "Change product base type"},
         {"value": "product_type", "label": "Change product type"},
+        {"value": "data", "label": "Change additional data"},
+    ]
+
+
+def _activities_permissions_enum() -> list[dict[str, str]]:
+    return [
+        {"value": "comment", "label": "Comment"},
+        {"value": "reviewable", "label": "Upload reviewables"},
     ]
 
 
@@ -55,7 +64,7 @@ async def _actions_enum() -> list[EnumItem]:
 async def _link_types_enum(project_name: str | None = None) -> list[EnumItem]:
     return await EnumRegistry.resolve(
         "linkTypes",
-        context={"project_name": project_name},
+        project_name=project_name,
     )
 
 
@@ -80,12 +89,13 @@ class FolderAccess(BaseSettingsModel):
     )
 
     def __hash__(self):
-        return hash(json_dumps(self.dict()))
+        return hash(json_dumps(self.model_dump()))
 
-    @validator("path")
-    def validate_path(cls, value, values):
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value, info: ValidationInfo):
         # Do not store path if the access_type does not support it
-        if values["access_type"] not in ["hierarchy", "children"]:
+        if info.data["access_type"] not in ["hierarchy", "children"]:
             return None
         # We display path WITH a leading slash
         # access control filters remove it when conditions are evaluated
@@ -144,6 +154,15 @@ class ActionsAccessList(BasePermissionsModel):
     actions: list[str] = SettingsField(
         default_factory=list,
         enum_resolver=_actions_enum,
+    )
+
+
+class ActivitiesAccessList(BasePermissionsModel):
+    activities: list[str] = SettingsField(
+        title=" ",
+        default_factory=list,
+        enum_resolver=_activities_permissions_enum,
+        widget="switchbox",
     )
 
 
@@ -279,6 +298,12 @@ class Permissions(BaseSettingsModel):
         default_factory=AttributeWriteAccessList,
         title="Restrict attribute update",
         description="Whitelist attributes a user can write",
+    )
+
+    activities: ActivitiesAccessList = SettingsField(
+        default_factory=ActivitiesAccessList,
+        title="Restrict activities",
+        description="Whitelist activities a user can perform",
     )
 
     actions: ActionsAccessList = SettingsField(

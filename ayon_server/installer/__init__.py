@@ -8,6 +8,7 @@ from ayon_server.installer.dependency_packages import download_dependency_packag
 from ayon_server.installer.installers import download_installer
 from ayon_server.lib.postgres import Postgres
 from ayon_server.logging import log_traceback, logger
+from ayon_server.utils import create_background_task
 
 from .addons import AddonZipInfo
 
@@ -40,7 +41,7 @@ class BackgroundInstaller(BackgroundWorker):
         logger.debug("Background installer: enqueuing event", event_id=event_id)
         await self.event_queue.put(event_id)
 
-    async def process_event(self, event_id: str) -> None:
+    async def process_event(self, event_id: str, *, no_queue: bool = False) -> None:
         res = await Postgres().fetch(
             " SELECT topic, status, summary, retries FROM events WHERE id = $1 ",
             event_id,
@@ -83,7 +84,12 @@ class BackgroundInstaller(BackgroundWorker):
             event_id=event_id,
         )
 
-        asyncio.create_task(handle_need_restart(self))
+        if no_queue:
+            await require_server_restart(
+                None, "Restart the server to apply the addon changes."
+            )
+        else:
+            create_background_task(handle_need_restart(self))
 
     async def run(self) -> None:
         # load past unprocessed events
@@ -118,6 +124,8 @@ class BackgroundInstaller(BackgroundWorker):
                     status="failed",
                     description=f"Failed to process event: {e}",
                     retries=r[0]["retries"] + 1,
+                    sender="background-installer",
+                    sender_type="system",
                 )
                 await self.enqueue(event_id)
 

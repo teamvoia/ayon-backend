@@ -1,21 +1,18 @@
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import Path
 
 from ayon_server.api.clientinfo import ClientInfo
 from ayon_server.api.dependencies import (
-    AccessToken,
     AllowGuests,
     CurrentUser,
-    Sender,
-    SenderType,
     UserName,
 )
 from ayon_server.api.responses import EmptyResponse
 from ayon_server.auth.session import Session
 from ayon_server.auth.utils import validate_password
-from ayon_server.config import ayonconfig
 from ayon_server.entities import UserEntity
+from ayon_server.entities.models.user import UserModel, UserPatchModel, UserPostModel
 from ayon_server.events import EventStream
 from ayon_server.exceptions import (
     BadRequestException,
@@ -23,7 +20,7 @@ from ayon_server.exceptions import (
     ForbiddenException,
     NotFoundException,
 )
-from ayon_server.helpers.rename_user import rename_user
+from ayon_server.helpers.rename_user import rename_user as _rename_user
 from ayon_server.lib.redis import Redis
 from ayon_server.logging import logger
 from ayon_server.types import USER_NAME_REGEX, Field, OPModel
@@ -36,19 +33,28 @@ from .router import router
 #
 
 
-@router.get("/me", response_model_exclude_none=True, dependencies=[AllowGuests])
+@router.get(
+    "/me",
+    response_model_exclude_none=True,
+    dependencies=[AllowGuests],
+    deprecated=True,
+)
 async def get_current_user(
     user: CurrentUser,
-) -> UserEntity.model.main_model:  # type: ignore
+) -> UserModel:
     """
     Return the current user information (based on the Authorization header).
     This is used for a profile page as well as as an initial check to ensure
     the user is still logged in.
+
+    This endpoint is deprecated and will be removed in a future version.
+    Use [GET] /api/profile instead, which returns the same information.
     """
 
     payload = user.payload
-    payload.ui_exposure_level = await user.get_ui_exposure_level()  # type: ignore
-    payload.data.pop("supportToken", None)
+    payload.ui_exposure_level = await user.get_ui_exposure_level()
+    if payload.data:
+        payload.data.pop("supportToken", None)
     return payload
 
 
@@ -60,7 +66,7 @@ async def get_current_user(
 @router.get("/{user_name}", response_model_exclude_none=True)
 async def get_user(
     user: CurrentUser, user_name: UserName
-) -> UserEntity.model.main_model | dict[str, str]:  # type: ignore
+) -> UserModel | dict[str, Any]:
     """
     Return the current user information (based on the Authorization header).
     This is used for a profile page as well as as an initial check to ensure
@@ -84,7 +90,7 @@ async def get_user(
     }
 
 
-class NewUserModel(UserEntity.model.post_model):  # type: ignore
+class NewUserModel(UserPostModel):
     password: str | None = Field(None, description="Password for the new user")
     api_key: str | None = Field(None, description="API Key for the new service user")
 
@@ -122,8 +128,6 @@ async def create_user(
     put_data: NewUserModel,
     user: CurrentUser,
     user_name: UserName,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Create a new user."""
 
@@ -135,7 +139,7 @@ async def create_user(
     try:
         nuser = await UserEntity.load(user_name)
     except NotFoundException:
-        nuser = UserEntity(put_data.dict() | {"name": user_name})
+        nuser = UserEntity(put_data.model_dump() | {"name": user_name})
         nuser.created_by = user.name
     else:
         raise ConflictException("User already exists")
@@ -160,12 +164,7 @@ async def create_user(
     }
 
     await nuser.save()
-    await EventStream.dispatch(
-        sender=sender,
-        sender_type=sender_type,
-        user=user.name,
-        **event,
-    )
+    await EventStream.dispatch(**event)
     return EmptyResponse()
 
 
@@ -173,41 +172,35 @@ async def create_user(
 async def delete_user(
     user: CurrentUser,
     user_name: UserName,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     if not user.is_manager:
         raise ForbiddenException
 
     target_user = await UserEntity.load(user_name)
 
+    entity_data = target_user.dict_simple()
+    entity_data["data"].pop("password", None)
+    entity_data["data"].pop("apiKey", None)
+
     event: dict[str, Any] = {
         "description": f"User {user_name} deleted",
         "summary": {"entityName": user_name},
+        "payload": {"entityData": entity_data},
     }
-    if ayonconfig.audit_trail:
-        event["payload"] = {
-            "entityData": target_user.dict_simple(),
-        }
 
     await target_user.delete()
-    await EventStream.dispatch(
-        "entity.user.deleted",
-        sender=sender,
-        sender_type=sender_type,
-        user=user.name,
-        **event,
-    )
+    await EventStream.dispatch("entity.user.deleted", **event)
     return EmptyResponse()
 
 
 @router.patch("/{user_name}")
 async def patch_user(
-    payload: UserEntity.model.patch_model,  # type: ignore
+    payload: UserPatchModel,
     user: CurrentUser,
     user_name: UserName,
-    access_token: AccessToken,
 ) -> EmptyResponse:
+    if payload.data is None:
+        payload.data = {}
     payload.data["updatedBy"] = user.name
     target_user = await UserEntity.load(user_name)
 
@@ -243,7 +236,7 @@ async def patch_user(
 
     validate_user_data(payload.data)
 
-    attrib_dict = payload.attrib.dict(exclude_unset=True)
+    attrib_dict = payload.attrib.model_dump(exclude_unset=True)
     avatar_changed = False
     if (
         "avatarUrl" in attrib_dict
@@ -291,7 +284,7 @@ async def change_password(
     user: CurrentUser,
     user_name: UserName,
 ) -> EmptyResponse:
-    patch_data_dict = patch_data.dict(exclude_unset=True)
+    patch_data_dict = patch_data.model_dump(exclude_unset=True)
 
     if "password" in patch_data_dict:
         if (user_name != user.name) and not (user.is_manager):
@@ -341,6 +334,8 @@ async def check_password(
 # Change login name
 #
 
+# Deprecated PATCH endpoint, replaced with POST for clarity and consistency
+
 
 class ChangeUserNameRequestModel(OPModel):
     new_name: str = Field(
@@ -351,13 +346,11 @@ class ChangeUserNameRequestModel(OPModel):
     )
 
 
-@router.patch("/{user_name}/rename")
+@router.patch("/{user_name}/rename", deprecated=True)
 async def change_user_name(
     patch_data: ChangeUserNameRequestModel,
     user: CurrentUser,
     user_name: UserName,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Changes the user name of a user.
 
@@ -368,12 +361,47 @@ async def change_user_name(
     if not user.is_manager:
         raise ForbiddenException
 
-    await rename_user(
+    await _rename_user(
         user_name,
         patch_data.new_name,
         invoking_user_name=user.name,
-        sender=sender,
-        sender_type=sender_type,
+    )
+    return EmptyResponse()
+
+
+# New and shiny rename user endpoint
+
+
+class RenameUserRequestModel(OPModel):
+    name: Annotated[
+        str,
+        Field(
+            description="New user name",
+            example="EvenBetterUser",
+            regex=USER_NAME_REGEX,
+        ),
+    ]
+
+
+@router.post("/{user_name}/rename")
+async def rename_user(
+    patch_data: RenameUserRequestModel,
+    user: CurrentUser,
+    user_name: UserName,
+) -> EmptyResponse:
+    """Changes the user name of a user.
+
+    This is a manager-only operation. Target user name must not exist.
+    This is a dangerous operation and should be used with caution.
+    """
+
+    if not user.is_manager:
+        raise ForbiddenException
+
+    await _rename_user(
+        user_name,
+        patch_data.name,
+        invoking_user_name=user.name,
     )
     return EmptyResponse()
 

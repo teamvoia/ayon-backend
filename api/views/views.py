@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import Path, Query, Request
+from fastapi import Body, Path, Query, Request
 
 from ayon_server.api.dependencies import CurrentUser
 from ayon_server.api.responses import EntityIdResponse
@@ -39,24 +39,24 @@ PViewType = Annotated[
     str,
     Path(
         title="View type",
-        regex=NAME_REGEX,
-        example="overview",
+        pattern=NAME_REGEX,
+        examples=["overview"],
     ),
 ]
 PViewId = Annotated[
     str,
     Path(
         title="View ID",
-        regex=r"^[0-9a-f]{32}$",
-        example=create_uuid(),
+        pattern=r"^[0-9a-f]{32}$",
+        examples=[create_uuid()],
     ),
 ]
 QProjectName = Annotated[
     str | None,
     Query(
         title="Project name",
-        example="my_project",
-        regex=PROJECT_NAME_REGEX,
+        examples=["my_project"],
+        pattern=PROJECT_NAME_REGEX,
     ),
 ]
 
@@ -268,7 +268,7 @@ async def create_view(
     request: Request,
     current_user: CurrentUser,
     view_type: PViewType,
-    payload: ViewPostModel,
+    payload: Annotated[ViewPostModel, Body(title="Payload")],
     project_name: QProjectName = None,
 ) -> EntityIdResponse:
     """Create a new view for current user."""
@@ -282,7 +282,7 @@ async def create_view(
             raise ForbiddenException("The '__base__' view label is reserved.")
 
     _json = await request.json()
-    payload_class = get_post_model_class(view_type)
+    payload_class = get_post_model_class()
     if "view_type" not in _json:
         _json["view_type"] = view_type
     payload = payload_class(**_json)
@@ -308,7 +308,7 @@ async def create_view(
         """
 
         if isinstance(payload.settings, OPModel):
-            settings_dict = payload.settings.dict()
+            settings_dict = payload.settings.model_dump()
         elif isinstance(payload.settings, dict):
             settings_dict = payload.settings
         else:
@@ -333,7 +333,7 @@ async def update_view(
     user: CurrentUser,
     view_type: PViewType,
     view_id: PViewId,
-    payload: ViewPatchModel,
+    payload: Annotated[ViewPatchModel, Body(title="Payload")],
     project_name: QProjectName = None,
 ) -> None:
     """Update a view in the database."""
@@ -341,7 +341,7 @@ async def update_view(
     _json = await request.json()
     if "view_type" not in _json:
         _json["view_type"] = view_type
-    payload_class = get_patch_model_class(view_type)
+    payload_class = get_patch_model_class()
     payload = payload_class(**_json)
 
     if payload.label == "__base__":
@@ -380,7 +380,7 @@ async def update_view(
 
         # Update the view with the new settings
 
-        update_dict = payload.dict(exclude_unset=True)
+        update_dict = payload.model_dump(exclude_unset=True)
 
         label = update_dict.get("label", res["label"])
         working = update_dict.get("working", res["working"])

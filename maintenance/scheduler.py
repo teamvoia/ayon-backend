@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+from typing import NoReturn
 
 from ayon_server.config import ayonconfig
 from ayon_server.logging import log_traceback, logger
@@ -12,7 +13,7 @@ class MaintenanceScheduler:
     is_running: bool = False
     task: asyncio.Task[None] | None = None
 
-    async def run(self):
+    async def run(self) -> NoReturn:
         while True:
             # Calculate the next scheduled time
             now = datetime.datetime.now()
@@ -29,9 +30,9 @@ class MaintenanceScheduler:
             # Execute the maintenance task
             await run_maintenance()
 
-    def start(self):
+    def start(self) -> None:
         if not ayonconfig.run_maintenance:
-            # mainenance scheduler is disabled
+            # maintenance scheduler is disabled
             return
 
         if self.task:
@@ -45,15 +46,15 @@ class MaintenanceScheduler:
             try:
                 await self.task
             except asyncio.CancelledError:
-                print("Maintenance scheduler stopped.")
+                logger.info("Maintenance scheduler stopped.")
 
-    async def run_maintenance(self):
+    async def run_maintenance(self, task_name: str | None = None) -> None:
         if self.is_running:
             logger.warning("Maintenance task is already running.")
             return
         self.is_running = True
         try:
-            await run_maintenance()
+            await run_maintenance(task_name=task_name)
         except Exception:
             log_traceback("Maintenance task failed. This should not happen.")
         self.is_running = False

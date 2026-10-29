@@ -4,8 +4,6 @@ from ayon_server.api.dependencies import (
     CurrentUser,
     FolderID,
     ProjectName,
-    Sender,
-    SenderType,
 )
 from ayon_server.api.responses import EmptyResponse, EntityIdResponse
 from ayon_server.exceptions import (
@@ -99,8 +97,6 @@ async def get_entity_list_folders(
 async def create_entity_list_folder(
     user: CurrentUser,
     project_name: ProjectName,
-    sender: Sender,
-    sender_type: SenderType,
     payload: EntityListFolderPostModel,
 ) -> EntityIdResponse:
     if payload.id is None:
@@ -120,7 +116,7 @@ async def create_entity_list_folder(
                 payload.parent_id,
                 user.name,
                 payload.access,
-                payload.data.dict(exclude_unset=True),
+                payload.data.model_dump(exclude_unset=True),
             )
         except Postgres.UniqueViolationError:
             raise ConflictException("Folder with the given ID already exists")
@@ -132,8 +128,6 @@ async def update_entity_list_folder(
     user: CurrentUser,
     project_name: ProjectName,
     folder_id: FolderID,
-    sender: Sender,
-    sender_type: SenderType,
     payload: EntityListFolderPatchModel,
 ) -> EmptyResponse:
     async with Postgres.transaction():
@@ -149,7 +143,7 @@ async def update_entity_list_folder(
         if not user.is_manager and res["owner"] != user.name:
             raise ForbiddenException("Only owner or manager can update this folder")
 
-        payload_dict = payload.dict(exclude_unset=True)
+        payload_dict = payload.model_dump(exclude_unset=True)
 
         new_payload = {
             "label": payload_dict.get("label", res["label"]),
@@ -182,8 +176,6 @@ async def delete_entity_list_folder(
     user: CurrentUser,
     project_name: ProjectName,
     folder_id: FolderID,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     async with Postgres.transaction():
         await Postgres.set_project_schema(project_name)
@@ -219,8 +211,6 @@ class EntityListFolderOrderModel(OPModel):
 async def set_entity_list_folders_order(
     user: CurrentUser,
     project_name: ProjectName,
-    sender: Sender,
-    sender_type: SenderType,
     payload: EntityListFolderOrderModel,
 ) -> EmptyResponse:
     async with Postgres.transaction():
