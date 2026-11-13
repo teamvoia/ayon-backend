@@ -1,24 +1,19 @@
-from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
 
-from ayon_server.entities import UserEntity
+from ayon_server.graphql.nodes.common import (
+    AttribFields,
+)
 from ayon_server.graphql.resolvers.tasks import get_tasks
 from ayon_server.graphql.types import Info
-from ayon_server.graphql.utils import parse_attrib_data, process_attrib_data
 from ayon_server.utils import json_dumps
 
 if TYPE_CHECKING:
     from ayon_server.graphql.connections import TasksConnection
 else:
-    TasksConnection = LazyType["TasksConnection", "..connections"]
-
-
-@UserEntity.strawberry_attrib()
-class UserAttribType:
-    pass
+    TasksConnection = Annotated["TasksConnection", strawberry.lazy("..connections")]
 
 
 class FakeRoot:
@@ -29,7 +24,8 @@ class FakeRoot:
 
 
 @strawberry.type
-class UserNode:
+class UserNode(AttribFields):
+    entity_type: strawberry.Private[str] = "user"
     name: str
     active: bool
     created_at: datetime
@@ -41,36 +37,17 @@ class UserNode:
     is_service: bool
     is_guest: bool
     is_developer: bool
+    is_staging_allowed: bool
+    invite_sent_at: datetime | None = None
+    invite_accepted_at: datetime | None = None
     has_password: bool
     disable_password_login: bool = False
     user_pool: str | None = None
     apiKeyPreview: str | None = None
     deleted: bool = False
 
-    _attrib: strawberry.Private[dict[str, Any]]
-    _user: strawberry.Private[UserEntity]  # The user making the request
-
     @strawberry.field
-    def attrib(self) -> UserAttribType:
-        return parse_attrib_data(
-            "user",
-            UserAttribType,
-            self._attrib,
-            user=self._user,
-        )
-
-    @strawberry.field
-    def all_attrib(self) -> str:
-        return json_dumps(
-            process_attrib_data(
-                "user",
-                self._attrib,
-                user=self._user,
-            )
-        )
-
-    @strawberry.field
-    async def tasks(self, info: Info, project_name: str) -> "TasksConnection":
+    async def tasks(self, info: Info, project_name: str) -> TasksConnection:
         root = FakeRoot(project_name)
         return await get_tasks(root, info, assignees=[self.name])
 
@@ -87,6 +64,15 @@ async def user_from_record(
     is_guest = data.get("isGuest", False)
     user_pool = data.get("userPool")
     disable_password_login = data.get("disablePasswordLogin", False)
+    is_staging_allowed = data.get("isStagingEnabled", False)
+
+    invite_sent_at = None
+    invite_accepted_at = None
+
+    if invite_sent_req := data.get("inviteRequest"):
+        invite_sent_at = datetime.fromtimestamp(invite_sent_req["time"], tz=UTC)
+    if "inviteAcceptedAt" in data:
+        invite_accepted_at = datetime.fromtimestamp(data["inviteAcceptedAt"], tz=UTC)
 
     current_user = context["user"]
 
@@ -112,6 +98,9 @@ async def user_from_record(
         is_service=is_service,
         is_guest=is_guest,
         is_developer=is_developer,
+        is_staging_allowed=is_staging_allowed,
+        invite_sent_at=invite_sent_at,
+        invite_accepted_at=invite_accepted_at,
         user_pool=user_pool,
         has_password=bool(data.get("password")),
         default_access_groups=data.get("defaultAccessGroups", []),

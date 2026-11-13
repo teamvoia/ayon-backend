@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi.websockets import WebSocket, WebSocketDisconnect
 
+from ayon_server.api.readiness import is_ready
 from ayon_server.api.system import restart_server
 from ayon_server.auth.session import Session
 from ayon_server.background.background_worker import BackgroundWorker
@@ -16,7 +17,7 @@ from ayon_server.events import EventStream, HandlerType
 from ayon_server.exceptions import UnauthorizedException
 from ayon_server.lib.redis import Redis
 from ayon_server.logging import log_traceback, logger
-from ayon_server.utils import json_dumps, json_loads
+from ayon_server.utils import create_background_task, json_dumps, json_loads
 
 ALWAYS_SUBSCRIBE = (
     "server.started",
@@ -55,7 +56,7 @@ async def handle_subscribers(message: dict[str, Any]) -> None:
     handlers = EventStream.global_hooks.get(topic, {}).values()
     if not handlers:
         return
-    asyncio.create_task(_handle_subscribers_task(event_id, list(handlers)))
+    create_background_task(_handle_subscribers_task(event_id, list(handlers)))
 
 
 class Client:
@@ -199,6 +200,10 @@ class Messaging(BackgroundWorker):
         if raw_message is None:
             await asyncio.sleep(0.01)
             if time.time() - self.last_msg > 5:
+                if not is_ready():
+                    # Don't emit heartbeats while the server is still
+                    # starting up (e.g. addons are still being initialized).
+                    return
                 message = {"topic": "heartbeat"}
                 self.last_msg = time.time()
             else:
@@ -218,7 +223,8 @@ class Messaging(BackgroundWorker):
         # (or only to those subscribed to the topic and authorized)
         #
 
-        for client in self.clients.values():
+        connected_clients = list(self.clients.values())
+        for client in connected_clients:
             project_name = message.get("project", None)
             if project_name is not None:
                 if topic == "inbox.message" or topic in ALWAYS_SUBSCRIBE:

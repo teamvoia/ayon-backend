@@ -1,6 +1,7 @@
 __all__ = ["Metrics", "get_metrics"]
 
 import time
+from typing import Any
 
 import httpx
 
@@ -134,7 +135,7 @@ class Metrics(OPModel):
     user_stats: list[UserStat] | None = Field(None, title="User stats")
 
 
-METRICS_SNAPSHOT = {}
+METRICS_SNAPSHOT: dict[str, Any] = {}
 METRICS_SETUP = [
     {
         "name": "project_counts",
@@ -248,6 +249,9 @@ async def should_post_metrics() -> bool:
 
 
 async def post_metrics():
+    if ayonconfig.metrics_disabled:
+        return
+
     try:
         headers = await CloudUtils.get_api_headers()
     except Exception:
@@ -270,7 +274,7 @@ async def post_metrics():
             system = True
 
     metrics = await get_metrics(saturated=saturated, system=system)
-    payload = metrics.dict(exclude_none=True)
+    payload = metrics.model_dump(exclude_none=True)
 
     try:
         async with httpx.AsyncClient(timeout=ayonconfig.http_timeout) as client:

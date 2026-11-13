@@ -10,6 +10,7 @@ from ayon_server.graphql.resolvers.common import (
 )
 from ayon_server.graphql.resolvers.pagination import create_pagination
 from ayon_server.graphql.types import Info
+from ayon_server.helpers.project_list import reads_all_projects
 from ayon_server.utils import SQLTool, json_loads
 
 
@@ -19,6 +20,7 @@ def bool2sql(value: bool | None) -> str:
     return "TRUE" if value else "FALSE"
 
 
+@reads_all_projects
 async def get_inbox(
     root,
     info: Info,
@@ -73,6 +75,7 @@ async def get_inbox(
         after=None,
         last=last,
         before=before,
+        skippable=True,
     )
 
     sql_conditions.append(paging_conds)

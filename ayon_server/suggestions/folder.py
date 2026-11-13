@@ -4,7 +4,7 @@ from ayon_server.entities import FolderEntity, UserEntity
 from ayon_server.entities.project import ProjectEntity
 from ayon_server.lib.postgres import Postgres
 
-from .common import get_relevant_users_cte
+from .common import get_relevant_users_cte, get_team_suggestion_items
 from .models import (
     FolderSuggestionItem,
     SuggestionType,
@@ -44,7 +44,7 @@ async def get_folder_suggestions(
             JOIN project_{project_name}.hierarchy h ON t.folder_id = h.id
             WHERE
                 t.assignees @> ARRAY[u.name]
-                AND h.path LIKE '{folder.path.lstrip("/")}%'
+                AND h.path LIKE '{(folder.path or "").lstrip("/")}%'
         ) r ON true
         WHERE
             u.name IN (SELECT name FROM relevant_users)
@@ -85,7 +85,7 @@ async def get_folder_suggestions(
         FROM project_{project_name}.tasks t
         JOIN project_{project_name}.folders f ON t.folder_id = f.id
         JOIN project_{project_name}.hierarchy h ON t.folder_id = h.id
-        WHERE h.path LIKE '{folder.path.lstrip("/")}%'
+        WHERE h.path LIKE '{(folder.path or "").lstrip("/")}%'
         ORDER BY t.name ASC;
     """
 
@@ -100,7 +100,7 @@ async def get_folder_suggestions(
             relevance=None,
         )
 
-        if row["folder_path"].strip("/") == folder.path.strip("/"):
+        if row["folder_path"].strip("/") == (folder.path or "").strip("/"):
             relevance = 10
         else:
             relevance = 0
@@ -117,5 +117,8 @@ async def get_folder_suggestions(
                 relevance=relevance,
             )
         )
+
+    # teams
+    result["teams"].extend(await get_team_suggestion_items(project_name))
 
     return result

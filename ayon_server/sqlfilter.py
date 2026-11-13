@@ -1,8 +1,16 @@
 import json
 import re
+from collections.abc import Callable
 from typing import Annotated, Any, Literal, Union, cast
 
-from pydantic import StrictBool, StrictFloat, StrictInt, StrictStr, validator
+from pydantic import (
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from ayon_server.logging import logger
 from ayon_server.types import Field, OPModel
@@ -23,6 +31,9 @@ ValueType = (
 OperatorType = Literal[
     "eq",
     "like",
+    "notlike",
+    "contains",
+    "re",
     "lt",
     "gt",
     "lte",
@@ -73,20 +84,30 @@ class QueryCondition(OPModel):
         ),
     ] = "eq"
 
-    @validator("operator", pre=True, always=True)
+    @field_validator("operator", mode="before")
+    @classmethod
     def convert_operator_to_lowercase(cls, v):
         return v.lower().replace("-", "").replace("_", "")
 
-    @validator("value")
-    def validate_value(cls, v: ValueType, values: dict[str, Any]):
-        if values.get("operator") in ("in", "notin", "any"):
-            if not isinstance(v, list):
+    @model_validator(mode="before")
+    @classmethod
+    def validate_value(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        operator = (
+            values.get("operator", "eq").lower().replace("-", "").replace("_", "")
+        )
+        value = values.get("value")
+
+        if operator in ("in", "notin", "any"):
+            if not isinstance(value, list):
                 raise ValueError("Value must be a list")
-        if values.get("operator") not in ("isnull", "notnull"):
-            if v is None:
+
+        if operator not in ("isnull", "notnull"):
+            if value is None:
                 raise ValueError("Value cannot be null")
 
-        return v
+        return values
 
 
 class QueryFilter(OPModel):
@@ -106,9 +127,27 @@ class QueryFilter(OPModel):
         ),
     ] = "and"
 
-    @validator("operator", pre=True, always=True)
+    @field_validator("operator", mode="before")
+    @classmethod
     def convert_operator_to_lowercase(cls, v):
         return v.lower()
+
+
+def filter_columns(f: QueryFilter) -> set[str]:
+    """Return the set of columns a filter references.
+
+    Columns are returned in their snake_case form, without the path to
+    the key within JSON columns, so `attrib/fps` is reported as `attrib`.
+    Resolvers use this to find out which joins a filter needs.
+    """
+    result: set[str] = set()
+    for condition in f.conditions:
+        if isinstance(condition, QueryFilter):
+            result |= filter_columns(condition)
+        else:
+            key = condition.key.replace("/", ".").split(".")[0]
+            result.add(camel_to_snake(key.strip()))
+    return result
 
 
 JSON_FIELDS = [
@@ -117,6 +156,8 @@ JSON_FIELDS = [
     "attrib",
     "data",
     "config",
+    "activity_data",
+    "reference_data",
 ]
 
 
@@ -159,7 +200,9 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
     single_json_column = kwargs.get("single_json_column", None)
     table_prefix = kwargs.get("table_prefix")
     column_whitelist = kwargs.get("column_whitelist", None)
-    column_map: dict[str, str] = kwargs.get("column_map", {})
+    column_map: dict[str, str | Callable[[str | None], str]] = kwargs.get(
+        "column_map", {}
+    )
 
     path = create_path_from_key(
         c.key,
@@ -171,10 +214,17 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
     cast_type = "text"
     safe_value: ValueType = None
     json_list_column: str | None = None
+    column_is_jsonb = False
 
     column = path[0]
+    mapped_attribute = False
     if column in column_map:
-        column = column_map[column]
+        mapped = column_map[column]
+        if callable(mapped):
+            mapped_attribute = len(path) > 1 and path[0] in json_fields
+            column = mapped(path[1] if mapped_attribute else None)
+        else:
+            column = mapped
 
     if len(path) == 1 and path[0] not in json_fields:
         # Hack to map project and user to their respective db column names
@@ -187,17 +237,18 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
                 safe_value = EntityID.parse(value)
             else:
                 safe_value = value.replace("'", "''")
-                safe_value = f"'{value}'"
+            safe_value = f"'{safe_value}'"
 
         elif isinstance(value, int | float):
             cast_type = "integer" if isinstance(value, int) else "number"
             safe_value = value
 
     elif (len(path) > 1 and path[0] in json_fields) or single_json_column:
+        column_is_jsonb = True
         if single_json_column:
             column = single_json_column
 
-        for k in path[1:]:
+        for k in path[2:] if mapped_attribute else path[1:]:
             column += f"->'{k}'"
 
         if operator in (
@@ -225,13 +276,16 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
                 else:
                     raise ValueError("Invalid value type in list")
 
-        if operator == "like":
+        if operator in ("like", "notlike", "contains", "re"):
             # JSON Field is a string, so we need to cast it to text
             if isinstance(value, str):
                 safe_value = value.replace("'", "''")
                 safe_value = f"'{safe_value}'"
             else:
-                raise ValueError("Value must be a string for 'like' operator")
+                raise ValueError(
+                    "Value must be a string for 'like', 'notlike', 'contains' "
+                    "or 're' operators"
+                )
 
         else:
             safe_value = json.dumps(value).replace("'", "''")
@@ -252,7 +306,7 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
                 return f"({column})::jsonb @> {safe_value}"
 
             elif operator == "excludesall":
-                return f"NOT ({column})::jsonb @> {safe_value}"
+                return f"NOT COALESCE(({column})::jsonb @> {safe_value}, FALSE)"
 
             elif operator == "includesany":
                 return f"""EXISTS (
@@ -327,11 +381,11 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
 
         elif operator == "excludesall":
             # Field does not contain the given array
-            return f"NOT (({column})::{cast_type}[] @> {arr_value})"
+            return f"NOT COALESCE(({column})::{cast_type}[] @> {arr_value}, FALSE)"
 
         elif operator == "excludesany":
             # Field does not contain any of the values in the array
-            return f"NOT(({column})::{cast_type}[] && {arr_value})"
+            return f"NOT COALESCE(({column})::{cast_type}[] && {arr_value}, FALSE)"
 
         elif operator == "includesany":
             # There's an intersection between the field and the array
@@ -344,8 +398,9 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
             return f"({column})::{cast_type} = ANY({arr_value})"
 
         elif operator == "notin":
-            # Field does not match any of the values in the array
-            return f"NOT ({column})::{cast_type} = ANY({arr_value})"
+            # Field does not match any of the values in the array.
+            # NULL (unset) fields match too, since they are not in the array
+            return f"NOT COALESCE(({column})::{cast_type} = ANY({arr_value}), FALSE)"
 
         else:
             raise ValueError(f"Invalid list operator: {operator}")
@@ -365,16 +420,31 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
     if safe_value is None:
         raise ValueError(f"Invalid value: {value}")
 
+    if operator in ("like", "notlike", "contains", "re"):
+        if mapped_attribute:
+            # A resolved value may be a COALESCE of several JSON accesses.
+            column = f"({column}) #>> '{{}}'"
+        else:
+            column = re.sub(r"->(?!.*->)", "->>", column)
+
     if operator == "eq":
         if type(value) is bool:
-            if value:
-                return f"coalesce({column}, 'false'::jsonb)::boolean"
-            return f"NOT coalesce({column}, 'false'::jsonb)::boolean"
+            if column_is_jsonb:
+                boolean_expr = f"coalesce({column}, 'false'::jsonb)::boolean"
+            else:
+                boolean_expr = f"coalesce({column}, FALSE)"
+            return boolean_expr if value else f"NOT {boolean_expr}"
         return f"{column} = {safe_value}"
     elif operator == "like":
-        # replace last -> with ->> to get text value
-        column = re.sub(r"->(?!.*->)", "->>", column)
         return f"({column}) ILIKE {safe_value}"
+    elif operator == "notlike":
+        # a missing value does not match the pattern, so it passes the filter
+        return f"NOT coalesce(({column}) ILIKE {safe_value}, FALSE)"
+    elif operator == "contains":
+        # literal substring match: unlike ILIKE, % _ and \ are not special
+        return f"strpos(lower({column}), lower({safe_value})) > 0"
+    elif operator == "re":
+        return f"({column}) SIMILAR TO {safe_value}"
     elif operator == "lt":
         return f"{column} < {safe_value}"
     elif operator == "gt":
@@ -384,7 +454,8 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
     elif operator == "gte":
         return f"{column} >= {safe_value}"
     elif operator == "ne":
-        return f"{column} != {safe_value}"
+        # NULL (unset) fields are not equal to the value either
+        return f"{column} IS DISTINCT FROM {safe_value}"
 
     # Field is a list
 
@@ -404,7 +475,7 @@ def build_condition(c: QueryCondition, **kwargs) -> str:
               FROM jsonb_array_elements({column}) AS elem
               WHERE elem = {safe_value}
             )"""
-        return f"NOT ({safe_value} = ANY({column}))"
+        return f"NOT COALESCE({safe_value} = ANY({column}), FALSE)"
 
     else:
         raise ValueError(f"Unsupported operator: {operator}")
@@ -417,7 +488,7 @@ def build_filter(f: QueryFilter | None, **kwargs) -> str | None:
         return None
 
     if not f.conditions:
-        logger.trace(f"Empty conditions {f.dict()}")
+        logger.trace(f"Empty conditions {f.model_dump()}")
         return None
 
     result = []
@@ -434,8 +505,10 @@ def build_filter(f: QueryFilter | None, **kwargs) -> str | None:
             elif isinstance(c.value, list) and not c.value:
                 if c.operator in ("in", "any"):
                     result.append("FALSE")
+                    continue
                 elif c.operator == "notin":
                     result.append("TRUE")
+                    continue
                 elif c.operator not in ["eq", "ne"]:
                     # Empty list with other operators is invalid, just skip it
                     continue

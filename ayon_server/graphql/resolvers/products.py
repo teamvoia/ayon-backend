@@ -1,7 +1,6 @@
 import json
 from typing import Annotated
 
-from ayon_server.access.utils import folder_access_list
 from ayon_server.entities import ProjectEntity
 from ayon_server.exceptions import BadRequestException, NotFoundException
 from ayon_server.graphql.connections import ProductsConnection
@@ -13,37 +12,62 @@ from ayon_server.graphql.resolvers.common import (
     ARGFirst,
     ARGHasLinks,
     ARGIds,
+    ARGIncludeInternalFolder,
     ARGLast,
+    ColumnMetadata,
     FieldInfo,
     argdesc,
+    create_child_folder_ctes,
+    create_folder_access_list,
+    get_folder_fields_block,
     get_has_links_conds,
     resolve,
     sortdesc,
 )
-from ayon_server.graphql.resolvers.pagination import create_pagination
+from ayon_server.graphql.resolvers.pagination import (
+    OrderBy,
+    create_pagination,
+    get_sort_keys,
+    sort_columns,
+    with_tiebreakers,
+)
 from ayon_server.graphql.types import Info
+from ayon_server.helpers.hierarchy_cache import AYON_INTERNAL_FOLDER_NAME
 from ayon_server.sqlfilter import QueryFilter, build_filter
 from ayon_server.types import (
     validate_name_list,
     validate_status_list,
     validate_type_name_list,
 )
-from ayon_server.utils import SQLTool, slugify
+from ayon_server.utils import SQLTool
 
+from .common import (
+    ARGVisibility,
+    EntityVisibility,
+    build_search_conditions,
+)
+from .field_stats import (
+    MetricTargetInput,
+    generate_field_stats,
+    generate_specific_stats_columns,
+    generate_stats_columns,
+)
 from .sorting import get_attrib_sort_case, get_status_sort_case
 
 SORT_OPTIONS = {
     "name": "products.name",
-    "path": "hierarchy.path || '/' || products.name",
     "productType": "products.product_type",
     "productBaseType": "products.product_base_type",
     "folderName": "folders.name",
+    "folderType": "folders.folder_type",
     "status": "products.status",
     "createdAt": "products.created_at",
     "updatedAt": "products.updated_at",
     "createdBy": "products.created_by",
     "updatedBy": "products.updated_by",
     "tags": "array_to_string(products.tags, '')",
+    "path": "",  # for docs only
+    "version": "",  # for docs only
 }
 
 
@@ -103,6 +127,10 @@ async def get_products(
         str | None,
         argdesc("Filter products using QueryFilter"),
     ] = None,
+    folder_filter: Annotated[
+        str | None,
+        argdesc("Filter products by their parent folders using QueryFilter"),
+    ] = None,
     version_filter: Annotated[
         str | None,
         argdesc("Filter products by their versions using QueryFilter"),
@@ -111,10 +139,29 @@ async def get_products(
         str | None,
         argdesc("Filter products by their tasks (via versions) using QueryFilter"),
     ] = None,
-    sort_by: Annotated[
+    representation_filter: Annotated[
         str | None,
+        argdesc(
+            "Filter products by their representations (via versions) using QueryFilter"
+        ),
+    ] = None,
+    has_reviewables: Annotated[
+        bool | None,
+        argdesc("Filter products that have at least one version with reviewables"),
+    ] = None,
+    sort_by: Annotated[
+        list[str] | None,
         sortdesc(SORT_OPTIONS),
     ] = None,
+    calculate_statistics: Annotated[
+        bool, argdesc("Whether to calculate column statistics")
+    ] = False,
+    calculate_specific_statistics: Annotated[
+        list[MetricTargetInput] | None,
+        argdesc("Map of attribute names to lists of desired statistical aggregations"),
+    ] = None,
+    include_internal_folder: ARGIncludeInternalFolder = False,
+    visibility: ARGVisibility = EntityVisibility.ALL,
 ) -> ProductsConnection:
     """Return a list of products."""
 
@@ -127,38 +174,28 @@ async def get_products(
         if not ids:
             return ProductsConnection(edges=[])
 
-    #
-    # SQL
-    #
+    use_folder_query = False
 
     sql_columns = [
         "products.*",
-        "folders.id AS _folder_id",
-        "folders.name AS _folder_name",
-        "folders.label AS _folder_label",
-        "folders.folder_type AS _folder_folder_type",
-        "folders.parent_id AS _folder_parent_id",
-        "folders.thumbnail_id AS _folder_thumbnail_id",
-        "folders.attrib AS _folder_attrib",
-        "folders.data AS _folder_data",
-        "folders.active AS _folder_active",
-        "folders.status AS _folder_status",
-        "folders.tags AS _folder_tags",
-        "folders.created_at AS _folder_created_at",
-        "folders.updated_at AS _folder_updated_at",
         "hierarchy.path AS _folder_path",
+        "folder_ex.attrib as inherited_attributes",
     ]
 
     sql_joins = [
         f"""
-        INNER JOIN project_{project_name}.folders
-        ON folders.id = products.folder_id
+        INNER JOIN project_{project_name}.hierarchy AS hierarchy
+        ON products.folder_id = hierarchy.id
         """,
         f"""
-        INNER JOIN project_{project_name}.hierarchy AS hierarchy
-        ON folders.id = hierarchy.id
+        INNER JOIN project_{project_name}.exported_attributes AS folder_ex
+        ON products.folder_id = folder_ex.folder_id
         """,
     ]
+
+    # joins that only add columns / only filter: see the page CTE below
+    sql_output_joins = []
+    sql_filter_joins = []
 
     sql_cte = []
     sql_conditions = []
@@ -167,43 +204,29 @@ async def get_products(
         if not ids:
             return ProductsConnection()
         sql_conditions.append(f"products.id IN {SQLTool.id_array(ids)}")
+    else:
+        if not include_internal_folder:
+            sql_conditions.append(
+                f"NOT starts_with(folder_ex.path, '{AYON_INTERNAL_FOLDER_NAME}')"
+            )
+
+        if visibility == EntityVisibility.VISIBLE:
+            sql_conditions.append("products.active AND folder_ex.active")
+        elif visibility == EntityVisibility.HIDDEN:
+            sql_conditions.append("(NOT products.active OR NOT folder_ex.active)")
 
     if folder_ids is not None:
         if not folder_ids:
             return ProductsConnection()
-        if not include_folder_children:
+        if include_folder_children:
+            use_folder_query = True
+            sql_cte.extend(create_child_folder_ctes(project_name, folder_ids))
             sql_conditions.append(
-                f"products.folder_id IN {SQLTool.id_array(folder_ids)}"
+                "products.folder_id IN (SELECT id FROM child_folder_ids)"
             )
         else:
-            sql_cte.append(
-                f"""
-                top_folder_paths AS (
-                    SELECT path FROM project_{project_name}.hierarchy
-                    WHERE id IN {SQLTool.id_array(folder_ids)}
-                )
-                """
-            )
-            sql_cte.append(
-                f"""
-                child_folder_ids AS (
-                    SELECT id FROM project_{project_name}.hierarchy
-                    WHERE EXISTS (
-                        SELECT 1 FROM top_folder_paths
-                        WHERE project_{project_name}.hierarchy.path
-                        LIKE top_folder_paths.path || '/%'
-                    )
-                    OR project_{project_name}.hierarchy.path = ANY(
-                        SELECT path FROM top_folder_paths
-                    )
-                )
-                """
-            )
-            sql_joins.append(
-                """
-                INNER JOIN child_folder_ids AS cfi
-                ON cfi.id = products.folder_id
-                """
+            sql_conditions.append(
+                f"products.folder_id IN {SQLTool.id_array(folder_ids)}"
             )
 
     elif root.__class__.__name__ == "FolderNode":
@@ -255,67 +278,41 @@ async def get_products(
             get_has_links_conds(project_name, "products.id", has_links)
         )
 
+    if has_reviewables is not None:
+        reviewables_cond = f"""
+            EXISTS (
+                SELECT 1 FROM project_{project_name}.versions AS v
+                JOIN project_{project_name}.activity_feed AS af
+                ON af.entity_id = v.id
+                AND af.entity_type = 'version'
+                AND af.activity_type = 'reviewable'
+                WHERE v.product_id = products.id
+            )
+        """
+        if has_reviewables:
+            sql_conditions.append(reviewables_cond)
+        else:
+            sql_conditions.append(f"NOT {reviewables_cond}")
+
     if name_ex is not None:
+        name_ex = name_ex.replace("'", "''")
         sql_conditions.append(f"products.name ~ '{name_ex}'")
 
     if path_ex is not None:
-        # TODO: sanitize
-        sql_conditions.append(f"'/' || hierarchy.path ~ '{path_ex}'")
+        path_ex = path_ex.replace("'", "''")
+        sql_conditions.append(f"'/' || folder_ex.path ~ '{path_ex}'")
 
     #
     # Access control
     #
 
-    access_list = None
-    if root.__class__.__name__ == "ProjectNode":
-        # Selecting products directly from the project node,
-        # so we need to check access rights
-        user = info.context["user"]
-        if user.is_guest:
-            # Guests need to provide explicit IDs
-            # that is handled above and provides a sufficient
-            # level of security.
-
-            # We may use additional checks for version lists in the future
-            pass
-        else:
-            access_list = await folder_access_list(user, project_name)
-            if access_list is not None:
-                sql_conditions.append(
-                    f"hierarchy.path like ANY ('{{ {','.join(access_list)} }}')"
-                )
-
-    #
-    # Do we need parent folder attributes?
-    # And most importantly - do we need to know which are inherited?
-    #
-
-    if any(field.endswith("folder.attrib") for field in fields):
-        sql_columns.extend(
-            [
-                "pr.attrib as _folder_project_attributes",
-                "ex.attrib as _folder_inherited_attributes",
-            ]
-        )
-        sql_joins.extend(
-            [
-                f"""
-                LEFT JOIN project_{project_name}.exported_attributes AS ex
-                ON folders.parent_id = ex.folder_id
-                """,
-                f"""
-                INNER JOIN public.projects AS pr
-                ON pr.name ILIKE '{project_name}'
-                """,
-            ]
-        )
-    else:
-        sql_columns.extend(
-            [
-                "'{}'::JSONB as _folder_project_attributes",
-                "'{}'::JSONB as _folder_inherited_attributes",
-            ]
-        )
+    user = info.context["user"]
+    if not user.is_manager:
+        access_list = await create_folder_access_list(root, info)
+        if access_list is not None:
+            sql_conditions.append(
+                f"folder_ex.path like ANY ('{{ {','.join(access_list)} }}')"
+            )
 
     if ff_field := fields.find_field("featuredVersion"):
         req_order = ff_field.arguments.get("order") or [
@@ -324,110 +321,77 @@ async def get_products(
             "latest",
         ]
 
-        sql_cte.append(
-            f"""
-            reviewables AS (
-                SELECT entity_id FROM project_{project_name}.activity_feed
-                WHERE entity_type = 'version'
-                AND activity_type = 'reviewable'
-            )
-            """
-        )
+        # Featured versions are correlated subqueries in the select list on
+        # purpose: they run only for the products that survive LIMIT, instead
+        # of ranking every version in the project.
+        # OFFSET 0 stops the planner from turning EXISTS into a hashed subplan
+        # that reads every reviewable in the project.
+        has_reviewables_col = f"""
+            EXISTS (
+                SELECT 1 FROM project_{project_name}.activity_feed af
+                WHERE af.entity_id = v.id
+                AND af.entity_type = 'version'
+                AND af.activity_type = 'reviewable'
+                OFFSET 0
+            ) AS has_reviewables
+        """
 
         if "hero" in req_order:
-            sql_cte.append(
+            sql_columns.append(
                 f"""
-                hero_versions AS (
-                    SELECT
-                        distinct on (versions.product_id)
-                        versions.*,
-                        hero_versions.id AS hero_version_id,
-                        rv.entity_id IS NOT NULL AS has_reviewables
-                    FROM project_{project_name}.versions AS versions
-
-                    JOIN project_{project_name}.versions AS hero_versions
-                    ON hero_versions.product_id = versions.product_id
-                    AND hero_versions.version < 0
-                    AND ABS(hero_versions.version) = versions.version
-
-                    LEFT JOIN reviewables AS rv
-                    ON versions.id = rv.entity_id
-
-                    ORDER BY versions.product_id, versions.version DESC
-                )
+                (
+                    SELECT to_jsonb(x.*) FROM (
+                        SELECT
+                            v.*,
+                            hv.id AS hero_version_id,
+                            {has_reviewables_col}
+                        FROM project_{project_name}.versions AS hv
+                        JOIN project_{project_name}.versions AS v
+                        ON v.product_id = hv.product_id
+                        AND v.version = ABS(hv.version)
+                        WHERE hv.product_id = products.id
+                        AND hv.version < 0
+                        ORDER BY v.creation_order DESC
+                        LIMIT 1
+                    ) x
+                ) AS _hero_version_data
                 """
             )
-            sql_joins.append(
-                """
-                LEFT JOIN hero_versions AS ff_hero
-                ON ff_hero.product_id = products.id
-                """
-            )
-            sql_columns.append("to_jsonb(ff_hero.*) as _hero_version_data")
 
         if "latestDone" in req_order:
-            sql_cte.append(
-                f"""
-                done_statuses AS (
-                    SELECT name from project_{project_name}.statuses
-                    WHERE data->>'state' = 'done'
-                )
-                """
-            )
-
-            sql_cte.append(
-                f"""
-                latest_done_versions AS (
-                    SELECT
-                        DISTINCT ON (versions.product_id)
-                        versions.*,
-                        rv.entity_id IS NOT NULL AS has_reviewables
-                    FROM project_{project_name}.versions
-
-                    JOIN done_statuses AS s
-                    ON versions.status = s.name
-
-                    LEFT JOIN reviewables AS rv
-                    ON versions.id = rv.entity_id
-
-                    ORDER BY versions.product_id, versions.version DESC
-                )
-                """
-            )
-            sql_joins.append(
-                """
-                LEFT JOIN latest_done_versions AS ff_latest_done
-                ON products.id = ff_latest_done.product_id
-                """
-            )
             sql_columns.append(
-                "to_jsonb(ff_latest_done.*) as _latest_done_version_data"
+                f"""
+                (
+                    SELECT to_jsonb(x.*) FROM (
+                        SELECT v.*, {has_reviewables_col}
+                        FROM project_{project_name}.versions AS v
+                        WHERE v.product_id = products.id
+                        AND v.status IN (
+                            SELECT name FROM project_{project_name}.statuses
+                            WHERE data->>'state' = 'done'
+                        )
+                        ORDER BY v.creation_order DESC
+                        LIMIT 1
+                    ) x
+                ) AS _latest_done_version_data
+                """
             )
 
         if "latest" in req_order:
-            sql_cte.append(
+            sql_columns.append(
                 f"""
-                latest_versions AS (
-                    SELECT
-                        DISTINCT ON (versions.product_id) versions.*,
-                        rv.entity_id IS NOT NULL AS has_reviewables
-                    FROM project_{project_name}.versions
-
-                    LEFT JOIN reviewables AS rv
-                    ON versions.id = rv.entity_id
-
-                    WHERE versions.version >= 0
-                    ORDER BY versions.product_id, versions.version DESC
-                )
+                (
+                    SELECT to_jsonb(x.*) FROM (
+                        SELECT v.*, {has_reviewables_col}
+                        FROM project_{project_name}.versions AS v
+                        WHERE v.product_id = products.id
+                        AND v.version >= 0
+                        ORDER BY v.creation_order DESC
+                        LIMIT 1
+                    ) x
+                ) AS _latest_version_data
                 """
             )
-            sql_joins.append(
-                """
-                LEFT JOIN latest_versions AS ff_latest
-                ON products.id = ff_latest.product_id
-                """
-            )
-            sql_columns.append("to_jsonb(ff_latest.*) as _latest_version_data")
 
     #
     # Version_list
@@ -438,11 +402,15 @@ async def get_products(
         sql_columns.extend(
             ["version_list.ids as version_ids", "version_list.versions as version_list"]
         )
-        sql_joins.append(
+        sql_output_joins.append(
             f"""
-            LEFT JOIN
-                project_{project_name}.version_list
-                ON products.id = version_list.product_id
+            LEFT JOIN LATERAL (
+                SELECT
+                    array_agg(v.id ORDER BY v.version) AS ids,
+                    array_agg(v.version ORDER BY v.version) AS versions
+                FROM project_{project_name}.versions AS v
+                WHERE v.product_id = products.id
+            ) AS version_list ON TRUE
             """
         )
 
@@ -451,16 +419,11 @@ async def get_products(
     #
 
     if search:
-        terms = slugify(search, make_set=True)
-        for term in terms:
-            sub_conditions = []
-            term = term.replace("'", "''")
-            sub_conditions.append(f"products.name ILIKE '%{term}%'")
-            sub_conditions.append(f"products.product_type ILIKE '%{term}%'")
-            sub_conditions.append(f"hierarchy.path ILIKE '%{term}%'")
-
-            condition = " OR ".join(sub_conditions)
-            sql_conditions.append(f"({condition})")
+        if cond := build_search_conditions(
+            search,
+            ["products.name", "products.product_type", "folder_ex.path"],
+        ):
+            sql_conditions.append(cond)
 
     #
     # Filter (actual product filter)
@@ -492,13 +455,41 @@ async def get_products(
         ):
             sql_conditions.append(fcond)
 
+    if folder_filter:
+        column_whitelist = [
+            "id",
+            "name",
+            "label",
+            "folder_type",
+            "parent_id",
+            "thumbnail_id",
+            "attrib",
+            "data",
+            "active",
+            "status",
+            "tags",
+            "created_at",
+            "updated_at",
+        ]
+        fdata = json.loads(folder_filter)
+        fq = QueryFilter(**fdata)
+        if fcond := build_filter(
+            fq,
+            column_whitelist=column_whitelist,
+            table_prefix="folders",
+            column_map={"attrib": "folder_ex.attrib"},
+        ):
+            sql_conditions.append(fcond)
+            use_folder_query = True
+
     #
-    # Filtering products by versions and tasks
+    # Filtering products by versions, tasks and representations
     #
 
-    if version_filter or task_filter:
+    if version_filter or task_filter or representation_filter:
         version_cond = ""
         task_cond = ""
+        representation_cond = ""
 
         if version_filter:
             column_whitelist = [
@@ -561,7 +552,43 @@ async def get_products(
             if fcond:
                 task_cond = f"{fcond}"
 
-        if version_cond or task_cond:
+        if representation_filter:
+            column_whitelist = [
+                "id",
+                "name",
+                "version_id",
+                "files",
+                "attrib",
+                "data",
+                "traits",
+                "status",
+                "tags",
+                "active",
+                "created_at",
+                "updated_at",
+            ]
+
+            fdata = json.loads(representation_filter)
+            fq = QueryFilter(**fdata)
+            fcond = build_filter(
+                fq,
+                column_whitelist=column_whitelist,
+                table_prefix="representations",
+            )
+            if fcond:
+                # The representation has to belong to the same version that
+                # matches the version and task filters, as in the versions
+                # resolver.
+                representation_cond = f"""
+                EXISTS (
+                    SELECT 1
+                    FROM project_{project_name}.representations AS representations
+                    WHERE representations.version_id = versions.id
+                    AND {fcond}
+                )
+                """
+
+        if version_cond or task_cond or representation_cond:
             vtconds = []
             tjoin = ""
             if version_cond:
@@ -572,6 +599,8 @@ async def get_products(
                 LEFT JOIN project_{project_name}.tasks
                 ON versions.task_id = tasks.id
                 """
+            if representation_cond:
+                vtconds.append(representation_cond)
 
             vtcondstr = "WHERE " + " AND ".join(vtconds)
 
@@ -589,29 +618,40 @@ async def get_products(
                 """
             )
 
-            sql_joins.append(
+            sql_filter_joins.append(
                 """
                 INNER JOIN filtered_versions
                 ON products.id = filtered_versions.product_id
                 """
             )
 
+    sort_keys = get_sort_keys(sort_by)
+    if (
+        use_folder_query
+        or "folder" in fields
+        or not {key.name for key in sort_keys}.isdisjoint(["folderName", "folderType"])
+    ):
+        folder_columns, folder_joins = get_folder_fields_block(
+            project_name, "products.folder_id", sql_joins=sql_joins
+        )
+        sql_columns.extend(folder_columns)
+        sql_joins.extend(folder_joins)
+
     #
     # Pagination
     #
 
-    order_by = ["products.creation_order"]
-    if sort_by is not None:
-        if sort_by == "status":
+    order_by: OrderBy = []
+    for sort_key, descending in sort_keys:
+        columns: list[str] = []
+        if sort_key == "status":
             status_type_case = get_status_sort_case(project, "products.status")
-            order_by.insert(0, status_type_case)
-        elif sort_by in SORT_OPTIONS:
-            order_by.insert(0, SORT_OPTIONS[sort_by])
-        elif sort_by.startswith("attrib."):
-            attr_name = sort_by[7:]
-            attr_case = await get_attrib_sort_case(attr_name, "products.attrib")
-            order_by.insert(0, attr_case)
-        elif sort_by == "version":
+            columns.append(status_type_case)
+
+        elif sort_key == "path":
+            columns.extend(["folder_ex.path", "products.name"])
+
+        elif sort_key == "version":
             # count by product version count
             sql_cte.append(
                 f"""
@@ -631,19 +671,63 @@ async def get_products(
                 ON pvc.product_id = products.id
                 """
             )
-            order_by.insert(0, "COALESCE(pvc.version_count, 0)")
+            columns.append("COALESCE(pvc.version_count, 0)")
+
+        elif sort_key.startswith("attrib."):
+            attr_name = sort_key[7:]
+            attr_case = await get_attrib_sort_case(attr_name, "products.attrib")
+            columns.append(attr_case)
+
+        elif sort_key in SORT_OPTIONS:
+            columns.append(SORT_OPTIONS[sort_key])
+
+        elif sort_key.startswith("task"):
+            pass  # this is not supported - not easily solvable
 
         else:
-            raise ValueError(f"Invalid sort_by value: {sort_by}")
+            raise ValueError(f"Invalid sort_by value: {sort_key}")
 
-    ordering, paging_conds, cursor = create_pagination(
-        order_by,
-        first,
-        after,
-        last,
-        before,
-    )
-    sql_conditions.append(paging_conds)
+        order_by.extend(sort_columns(columns, descending))
+
+    order_by = with_tiebreakers(order_by, "products.creation_order")
+
+    sql_from = f"project_{project_name}.products AS products"
+    main_joins = sql_joins + sql_filter_joins + sql_output_joins
+
+    ordering = ""
+    cursor = "''"
+    if not calculate_statistics and not calculate_specific_statistics:
+        ordering, paging_conds, cursor = create_pagination(
+            order_by,
+            first,
+            after,
+            last,
+            before,
+        )
+        sql_conditions.append(paging_conds)
+
+        # Pick the page first and hydrate only its rows (as the versions
+        # resolver does). Sorting the full rows - whole folders and their
+        # attributes included - of every matching product does not fit
+        # in work_mem and spills to disk.
+        sql_cte.append(
+            f"""
+            page AS MATERIALIZED (
+                SELECT products.id
+                FROM project_{project_name}.products AS products
+                {" ".join(sql_joins + sql_filter_joins)}
+                {SQLTool.conditions(sql_conditions)}
+                {ordering}
+            )
+            """
+        )
+        sql_from = f"""
+            page
+            INNER JOIN project_{project_name}.products AS products
+            ON products.id = page.id
+            """
+        main_joins = sql_joins + sql_output_joins
+        sql_conditions = []
 
     #
     # Query
@@ -651,26 +735,66 @@ async def get_products(
 
     if sql_cte:
         cte = ", ".join(sql_cte)
-        cte = f"WITH {cte}"
+        # RECURSIVE (harmless for the non-recursive CTEs here) is required
+        # when folder_ids+includeFolderChildren adds create_child_folder_ctes'
+        # self-referencing CTE.
+        cte = f"WITH RECURSIVE {cte}"
     else:
         cte = ""
 
     sql_columns.insert(0, cursor)
     sql_columns_str = ",\n".join(sql_columns)
 
+    default_columns_metadata: list[ColumnMetadata] = [
+        ColumnMetadata("name", "string"),
+        ColumnMetadata("product_type", "string"),
+        ColumnMetadata("product_base_type", "string"),
+        ColumnMetadata("active", "bool"),
+        ColumnMetadata("status", "string"),
+    ]
+
+    stats_select_clause = None
+    if calculate_specific_statistics:
+        stats_select_clause = generate_specific_stats_columns(
+            calculate_specific_statistics
+        )
+    elif calculate_statistics:
+        stats_select_clause = generate_stats_columns(default_columns_metadata)
+
+    raw_data_start = ""
+    raw_data_end = ""
+    if stats_select_clause:
+        cte_prefix = ",\n" if cte else "WITH"
+        raw_data_start = f"{cte_prefix} raw_data AS ("
+        raw_data_end = f"""
+            )
+            SELECT
+                {stats_select_clause}
+            FROM raw_data;
+            """
+
     query = f"""
         {cte}
+        {raw_data_start}
         SELECT {sql_columns_str}
-        FROM project_{project_name}.products
-        {" ".join(sql_joins)}
+        FROM {sql_from}
+        {" ".join(main_joins)}
         {SQLTool.conditions(sql_conditions)}
         {ordering}
+        {raw_data_end}
     """
 
     # print()
-    # print (query)
+    # print("Products query:")
+    # print(query)
     # print()
     #
+
+    if stats_select_clause:
+        field_stats = await generate_field_stats(query)
+
+        return ProductsConnection(edges=[], field_stats=field_stats)
+
     return await resolve(
         ProductsConnection,
         ProductEdge,

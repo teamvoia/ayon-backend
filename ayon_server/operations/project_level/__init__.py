@@ -7,10 +7,11 @@ __all__ = [
 
 import asyncio
 import random
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from asyncpg.exceptions import DeadlockDetectedError, IntegrityConstraintViolationError
-from pydantic.error_wrappers import ValidationError
+from pydantic import ValidationError
 
 from ayon_server.entities import UserEntity
 from ayon_server.events import EventStream
@@ -25,14 +26,20 @@ from ayon_server.helpers.get_entity_class import get_entity_class
 from ayon_server.lib.postgres import Postgres
 from ayon_server.lib.postgres_exceptions import parse_postgres_exception
 from ayon_server.logging import log_traceback, logger
-from ayon_server.types import ProjectLevelEntityType
-from ayon_server.utils import create_uuid
+from ayon_server.types import OPModel, ProjectLevelEntityType
+from ayon_server.utils import create_background_task, create_uuid
 
 from ..common import OperationType, RollbackException
 from .entity_create import create_project_level_entity
 from .entity_delete import delete_project_level_entity
 from .entity_update import update_project_level_entity
 from .models import OperationModel, OperationResponseModel, OperationsResponseModel
+
+
+class OperationsProgress(OPModel):
+    index: int = 0
+    total: int
+    operation: OperationModel
 
 
 async def _process_events(
@@ -117,6 +124,7 @@ async def _process_operations(
     *,
     can_fail: bool = False,
     raise_on_error: bool = True,
+    progress_handler: Callable[[OperationsProgress], Awaitable[None]] | None = None,
 ) -> tuple[list[dict[str, Any]], OperationsResponseModel]:
     """Process a list of operations.
 
@@ -134,7 +142,7 @@ async def _process_operations(
     entity_types: set[ProjectLevelEntityType] = set()
 
     logger.debug(f"[OPS] {len(operations)} project {project_name} operations")
-    for operation in operations:
+    for i, operation in enumerate(operations):
         if operation.as_user:
             user = user_map.get(operation.as_user)
         else:
@@ -147,6 +155,12 @@ async def _process_operations(
             project=project_name,
             operation_id=operation.id,
         )
+
+        if progress_handler:
+            progress = OperationsProgress(
+                index=i, total=len(operations), operation=operation
+            )
+            await progress_handler(progress)
 
         try:
             # This is a neat trick. transaction() will try
@@ -273,6 +287,36 @@ async def _process_operations(
     return events, OperationsResponseModel(operations=result, success=success)
 
 
+def _folder_refresh_kwargs(
+    operations: list[OperationModel],
+    response: OperationsResponseModel,
+) -> dict[str, Any]:
+    """Return what FolderEntity.refresh_views needs to refresh.
+
+    Exported attributes depend on the name, parent, own attributes and
+    the active flag of a folder. Deleted folders lose them by the cascade.
+    """
+    data = {op.id: op.data or {} for op in operations}
+    folder_ids: list[str] = []
+    refresh_hierarchy = False
+    for res in response.operations:
+        if res.entity_type != "folder" or not res.success or not res.entity_id:
+            continue
+        if res.type == "delete":
+            refresh_hierarchy = True
+        elif res.type == "create":
+            # the hierarchy is refreshed when a folder is created
+            folder_ids.append(res.entity_id)
+        else:
+            changed = data.get(res.id, {}).keys()
+            if changed & {"name", "parent_id", "parentId"}:
+                refresh_hierarchy = True
+                folder_ids.append(res.entity_id)
+            elif changed & {"attrib", "active"}:
+                folder_ids.append(res.entity_id)
+    return {"refresh_hierarchy": refresh_hierarchy, "folder_ids": folder_ids}
+
+
 class ProjectLevelOperations:
     def __init__(
         self,
@@ -321,7 +365,7 @@ class ProjectLevelOperations:
         as_user: str | UserEntity | None = None,
         operation_id: str | None = None,
         force: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         if isinstance(as_user, UserEntity):
             self.user_entities_map[as_user.name] = as_user
@@ -349,7 +393,7 @@ class ProjectLevelOperations:
         entity_id: str | None = None,
         *,
         as_user: str | UserEntity | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Create a project level entity."""
         self.add(
@@ -366,7 +410,7 @@ class ProjectLevelOperations:
         entity_id: str,
         *,
         as_user: str | UserEntity | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Update a project level entity."""
         self.add(
@@ -424,6 +468,7 @@ class ProjectLevelOperations:
         can_fail: bool,
         raise_on_error: bool,
         wait_for_events: bool,
+        progress_handler: Callable[[OperationsProgress], Awaitable[None]] | None = None,
     ) -> OperationsResponseModel:
         self._validate()
 
@@ -449,6 +494,7 @@ class ProjectLevelOperations:
                 user_map=self.user_entities_map,
                 can_fail=True,
                 raise_on_error=False,
+                progress_handler=progress_handler,
             )
 
         else:
@@ -460,12 +506,14 @@ class ProjectLevelOperations:
                             self.operations,
                             user_map=self.user_entities_map,
                             raise_on_error=raise_on_error,
+                            progress_handler=progress_handler,
                         )
-                    if not response.success:
-                        events = []
-                        # Raise rollback exception to roll back the transaction
-                        # but silence it so the response is returned
-                        raise RollbackException()
+                        if not response.success:
+                            events = []
+                            # Raise rollback exception to roll back the
+                            # transaction (it must be raised inside it),
+                            # but silence it so the response is returned
+                            raise RollbackException()
 
                 except RollbackException:
                     logger.debug("[OPS] Operations rolled back")
@@ -488,7 +536,10 @@ class ProjectLevelOperations:
                 entity_class = get_entity_class(entity_type)
                 try:
                     logger.trace(f"[OPS] Refreshing views for {entity_type}")
-                    await entity_class.refresh_views(self.project_name)
+                    kwargs: dict[str, Any] = {}
+                    if entity_type == "folder":
+                        kwargs = _folder_refresh_kwargs(self.operations, response)
+                    await entity_class.refresh_views(self.project_name, **kwargs)
                 except DeadlockDetectedError:
                     logger.debug("[OPS] View refresh deadlock. Skipping refresh.")
 
@@ -506,7 +557,7 @@ class ProjectLevelOperations:
                 # Otherwise, we create a task to process the events
                 # in the background and return the response immediately.
                 logger.trace("[OPS] Dispatching events in the background")
-                task = asyncio.create_task(
+                task = create_background_task(
                     _process_events(
                         events,
                         sender=self.sender,
@@ -522,6 +573,7 @@ class ProjectLevelOperations:
         can_fail: bool = False,
         raise_on_error: bool = True,
         wait_for_events: bool = True,
+        progress_handler: Callable[[OperationsProgress], Awaitable[None]] | None = None,
     ) -> OperationsResponseModel:
         """
         Process the enqueued operations.
@@ -541,6 +593,7 @@ class ProjectLevelOperations:
                 can_fail=can_fail,
                 raise_on_error=raise_on_error,
                 wait_for_events=wait_for_events,
+                progress_handler=progress_handler,
             )
         finally:
             self.operations = []

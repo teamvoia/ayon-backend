@@ -1,8 +1,7 @@
 import json
 from typing import Annotated
 
-from ayon_server.access.access_groups import AccessGroups
-from ayon_server.access.utils import path_to_paths
+from ayon_server.access.task_access import FullAccess, create_task_acl
 from ayon_server.entities import ProjectEntity
 from ayon_server.entities.core import attribute_library
 from ayon_server.exceptions import BadRequestException, NotFoundException
@@ -15,16 +14,21 @@ from ayon_server.graphql.resolvers.common import (
     ARGFirst,
     ARGHasLinks,
     ARGIds,
+    ARGIncludeInternalFolder,
     ARGLast,
     AttributeFilterInput,
+    ColumnMetadata,
     FieldInfo,
     argdesc,
+    create_child_folder_ctes,
     create_folder_access_list,
+    get_folder_fields_block,
     get_has_links_conds,
     resolve,
     sortdesc,
 )
 from ayon_server.graphql.types import Info
+from ayon_server.helpers.hierarchy_cache import AYON_INTERNAL_FOLDER_NAME
 from ayon_server.sqlfilter import QueryFilter, build_filter
 from ayon_server.types import (
     sanitize_string_list,
@@ -33,9 +37,27 @@ from ayon_server.types import (
     validate_type_name_list,
     validate_user_name_list,
 )
-from ayon_server.utils import SQLTool, slugify
+from ayon_server.utils import SQLTool
 
-from .pagination import create_pagination
+from .common import (
+    ARGVisibility,
+    EntityVisibility,
+    build_search_conditions,
+    get_resolved_attrib_expression,
+)
+from .field_stats import (
+    MetricTargetInput,
+    generate_field_stats,
+    generate_specific_stats_columns,
+    generate_stats_columns,
+)
+from .pagination import (
+    OrderBy,
+    create_pagination,
+    get_sort_keys,
+    sort_columns,
+    with_tiebreakers,
+)
 from .sorting import (
     get_attrib_sort_case,
     get_status_sort_case,
@@ -51,53 +73,8 @@ SORT_OPTIONS = {
     "updatedAt": "tasks.updated_at",
     "createdBy": "tasks.created_by",
     "updatedBy": "tasks.updated_by",
+    "folderName": "folders.name",
 }
-
-
-class FullAccess(Exception):
-    pass
-
-
-async def create_task_acl(
-    project_name: str, access_group_names: list[str]
-) -> tuple[set[str], bool]:
-    """Get the access control list for tasks based on access groups.
-
-    - set of folder paths we have full access to
-    - bool indicating if we have 'assigned' access
-
-    raises FullAccess if we have full access to all tasks
-
-    """
-
-    full_access = set()
-    assigned_access: bool = False
-
-    for ag_name in access_group_names:
-        if (ag_name, project_name) in AccessGroups.access_groups:
-            ag_perms = AccessGroups.access_groups[(ag_name, project_name)]
-        elif (ag_name, "_") in AccessGroups.access_groups:
-            ag_perms = AccessGroups.access_groups[(ag_name, "_")]
-        else:
-            continue
-        read_perms = ag_perms.read
-        if not read_perms.enabled:
-            # we have an access group that does not restrict read access,
-            # so we have full access
-            raise FullAccess()
-        for acl in read_perms.access_list:
-            if acl.access_type == "assigned":
-                assigned_access = True
-                continue
-
-            if acl.path is None:
-                # make linter happy. path is nullable only for 'assigned' type
-                continue
-
-            for p in path_to_paths(acl.path, True, True):
-                full_access.add(p)
-
-    return full_access, assigned_access
 
 
 async def get_tasks(
@@ -165,7 +142,16 @@ async def get_tasks(
     folder_filter: Annotated[
         str | None, argdesc("Filter tasks by queryfilter on folders")
     ] = None,
-    sort_by: Annotated[str | None, sortdesc(SORT_OPTIONS)] = None,
+    sort_by: Annotated[list[str] | None, sortdesc(SORT_OPTIONS)] = None,
+    calculate_statistics: Annotated[
+        bool, argdesc("Whether to calculate column statistics")
+    ] = False,
+    calculate_specific_statistics: Annotated[
+        list[MetricTargetInput] | None,
+        argdesc("Map of attribute names to lists of desired statistical aggregations"),
+    ] = None,
+    include_internal_folder: ARGIncludeInternalFolder = False,
+    visibility: ARGVisibility = EntityVisibility.ALL,
 ) -> TasksConnection:
     """Return a list of tasks."""
 
@@ -190,7 +176,7 @@ async def get_tasks(
     sql_columns = [
         "tasks.*",
         "hierarchy.path AS _folder_path",
-        "f_ex.attrib as parent_folder_attrib",
+        "f_ex.attrib as inherited_attributes",
     ]
 
     sql_joins = [
@@ -205,27 +191,65 @@ async def get_tasks(
     ]
 
     if fields.any_endswith("hasReviewables"):
-        sql_cte.append(
+        sql_columns.append(
             f"""
-            reviewables AS (
-                SELECT v.task_id AS task_id FROM project_{project_name}.activity_feed af
-                INNER JOIN project_{project_name}.versions v
+            EXISTS (
+                SELECT 1 FROM project_{project_name}.versions v
+                INNER JOIN project_{project_name}.activity_feed af
                 ON af.entity_id = v.id
                 AND af.entity_type = 'version'
                 AND af.activity_type = 'reviewable'
-            )
+                WHERE v.task_id = tasks.id
+                OFFSET 0
+            ) AS has_reviewables
             """
         )
 
+    if fields.any_endswith("latestComments"):
         sql_columns.append(
-            "EXISTS (SELECT 1 FROM reviewables WHERE task_id = tasks.id) "
-            "AS has_reviewables"
+            f"""
+            (
+                SELECT json_agg(
+                    json_build_object(
+                        'activity_id', activity_id,
+                        'body', body,
+                        'author', author,
+                        'created_at', created_at
+                    )
+                    ORDER BY created_at DESC
+                )
+                FROM (
+                    SELECT
+                        activity_id,
+                        body,
+                        activity_data->>'author' AS author,
+                        created_at
+                    FROM project_{project_name}.activity_feed
+                    WHERE activity_type = 'comment'
+                    AND entity_type = 'task'
+                    AND reference_type = 'origin'
+                    AND entity_id = tasks.id
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                ) x
+            ) AS latest_comments
+            """
         )
 
     if ids is not None:
         if not ids:
             return TasksConnection()
         sql_conditions.append(f"tasks.id IN {SQLTool.id_array(ids)}")
+    else:
+        if not include_internal_folder:
+            sql_conditions.append(
+                f"NOT starts_with(hierarchy.path, '{AYON_INTERNAL_FOLDER_NAME}')"
+            )
+
+        if visibility == EntityVisibility.VISIBLE:
+            sql_conditions.append("(tasks.active AND f_ex.active)")
+        elif visibility == EntityVisibility.HIDDEN:
+            sql_conditions.append("(NOT tasks.active OR NOT f_ex.active)")
 
     if folder_ids is not None:
         if not folder_ids:
@@ -233,33 +257,12 @@ async def get_tasks(
 
         if include_folder_children:
             use_folder_query = True
-            sql_cte.append(
-                f"""
-                top_folder_paths AS (
-                    SELECT path FROM project_{project_name}.hierarchy
-                    WHERE id IN {SQLTool.id_array(folder_ids)}
-                )
+            sql_cte.extend(create_child_folder_ctes(project_name, folder_ids))
+            sql_joins.append(
                 """
-            )
-
-            sql_cte.append(
-                f"""
-                child_folder_ids AS (
-                    SELECT id FROM project_{project_name}.hierarchy
-                    WHERE EXISTS (
-                        SELECT 1
-                        FROM top_folder_paths
-                        WHERE project_{project_name}.hierarchy.path
-                        LIKE top_folder_paths.path || '/%'
-                    )
-                    OR project_{project_name}.hierarchy.path = ANY (
-                        SELECT path FROM top_folder_paths
-                    )
-                )
+                INNER JOIN child_folder_ids AS cfi
+                ON tasks.folder_id = cfi.id
                 """
-            )
-            sql_conditions.append(
-                "tasks.folder_id IN (SELECT id FROM child_folder_ids)"
             )
 
         else:
@@ -356,6 +359,10 @@ async def get_tasks(
                 if sql_acl_conds:
                     sql_conditions.append(f"({' OR '.join(sql_acl_conds)})")
 
+    task_attrib_exp = get_resolved_attrib_expression(
+        "task", "tasks.attrib", inherited="f_ex.attrib"
+    )
+
     if attributes:
         for attribute_input in attributes:
             if not attribute_library.is_valid("task", attribute_input.name):
@@ -363,8 +370,8 @@ async def get_tasks(
             values = [v.replace("'", "''") for v in attribute_input.values]
             sql_conditions.append(
                 f"""
-                (coalesce(f_ex.attrib, '{{}}'::jsonb ) || tasks.attrib)
-                ->>'{attribute_input.name}' IN {SQLTool.array(values)}
+                ({task_attrib_exp(attribute_input.name)})
+                #>> '{{}}' IN {SQLTool.array(values)}
                 """
             )
 
@@ -395,9 +402,7 @@ async def get_tasks(
             fq,
             column_whitelist=column_whitelist,
             table_prefix="tasks",
-            column_map={
-                "attrib": "(coalesce(f_ex.attrib, '{}'::jsonb ) || tasks.attrib)"
-            },
+            column_map={"attrib": task_attrib_exp},
         ):
             sql_conditions.append(fcond)
 
@@ -424,22 +429,29 @@ async def get_tasks(
             fq,
             column_whitelist=column_whitelist,
             table_prefix="folders",
-            column_map={"attrib": "f_ex.attrib"},
+            column_map={
+                "attrib": get_resolved_attrib_expression(
+                    "folder",
+                    "folders.attrib",
+                    inherited="folder_ex.attrib",
+                    project="projects.attrib",
+                )
+            },
         ):
             sql_conditions.append(fcond)
             use_folder_query = True
 
     if search:
         use_folder_query = True
-        terms = slugify(search, make_set=True)
-        # isn't it nice that slugify effectively prevents sql injections?
-        for term in terms:
-            cond = f"""(
-            tasks.name ILIKE '%{term}%'
-            OR tasks.label ILIKE '%{term}%'
-            OR tasks.task_type ILIKE '%{term}%'
-            OR hierarchy.path ILIKE '%{term}%'
-            )"""
+        if cond := build_search_conditions(
+            search,
+            [
+                "tasks.name",
+                "tasks.label",
+                "tasks.task_type",
+                "hierarchy.path",
+            ],
+        ):
             sql_conditions.append(cond)
 
     #
@@ -448,91 +460,64 @@ async def get_tasks(
     #
 
     # Do we need the parent folder data?
-    if use_folder_query or "folder" in fields:
-        sql_columns.extend(
-            [
-                "folders.id AS _folder_id",
-                "folders.name AS _folder_name",
-                "folders.label AS _folder_label",
-                "folders.folder_type AS _folder_folder_type",
-                "folders.thumbnail_id AS _folder_thumbnail_id",
-                "folders.parent_id AS _folder_parent_id",
-                "folders.attrib AS _folder_attrib",
-                "folders.data AS _folder_data",
-                "folders.active AS _folder_active",
-                "folders.status AS _folder_status",
-                "folders.tags AS _folder_tags",
-                "folders.created_at AS _folder_created_at",
-                "folders.updated_at AS _folder_updated_at",
-                "projects.attrib as _folder_project_attributes",
-                "pf_ex.attrib as _folder_inherited_attributes",
-            ]
+    sort_keys = get_sort_keys(sort_by)
+    sort_key_names = {key.name for key in sort_keys}
+    if use_folder_query or "folder" in fields or "folderName" in sort_key_names:
+        folder_columns, folder_joins = get_folder_fields_block(
+            project_name, "tasks.folder_id", is_inner=False, sql_joins=sql_joins
         )
-
-        # Use inner join, tasks without folder cannot exist
-
-        sql_joins.extend(
-            [
-                f"""
-                INNER JOIN project_{project_name}.folders
-                ON folders.id = tasks.folder_id
-                """,
-                # but not here. parent's parent can be NULL
-                f"""
-                LEFT JOIN project_{project_name}.exported_attributes AS pf_ex
-                ON folders.parent_id = pf_ex.folder_id
-                """,
-                f"""
-                INNER JOIN public.projects AS projects
-                ON projects.name ILIKE '{project_name}'
-                """,
-            ]
-        )
+        sql_columns.extend(folder_columns)
+        sql_joins.extend(folder_joins)
 
     #
     # Pagination
     #
 
-    order_by = []
-    if sort_by is not None:
-        if sort_by == "taskType":
+    order_by: OrderBy = []
+    for sort_key, descending in sort_keys:
+        columns: list[str] = []
+        if sort_key == "taskType":
             task_type_case = get_task_types_sort_case(project)
-            order_by.append(task_type_case)
-        elif sort_by == "status":
+            columns.append(task_type_case)
+        elif sort_key == "status":
             status_type_case = get_status_sort_case(project, "tasks.status")
-            order_by.append(status_type_case)
-        elif sort_by in SORT_OPTIONS:
-            order_by.insert(0, SORT_OPTIONS[sort_by])
-        elif sort_by == "path":
-            order_by = ["hierarchy.path", "tasks.name"]
-        elif sort_by.startswith("attrib."):
-            attr_name = sort_by[7:]
-            exp = "(f_ex.attrib || tasks.attrib)"
-            attr_case = await get_attrib_sort_case(attr_name, exp)
-            order_by.insert(0, attr_case)
+            columns.append(status_type_case)
+        elif sort_key in SORT_OPTIONS:
+            columns.append(SORT_OPTIONS[sort_key])
+        elif sort_key == "path":
+            columns.extend(["hierarchy.path", "tasks.name"])
+        elif sort_key.startswith("attrib."):
+            attr_name = sort_key[7:]
+            attr_case = await get_attrib_sort_case(attr_name, task_attrib_exp)
+            columns.append(attr_case)
         else:
-            raise BadRequestException(f"Invalid sort_by value: {sort_by}")
+            raise BadRequestException(f"Invalid sort_by value: {sort_key}")
+
+        order_by.extend(sort_columns(columns, descending))
 
     if not order_by:
         # If no sorting specified, use creation order to have stable sorting
         # as the requester doesn't care about the order in this case.
         order_by.append("tasks.creation_order")
 
-    elif len(order_by) < 2:
-        # If a single sort criteria is specified, add a secondary sort by name
-        # to have stable sorting when multiple items have the same value
-        # In this case we don't want to use creation order as secondary sort,
-        # because sorting is mainly invoked from the GUI and path makes more sense
-        order_by.append("hierarchy.path || '/' || tasks.name")
+    else:
+        # Add a secondary sort by path to have stable sorting when multiple
+        # items have the same values. In this case we don't want to use
+        # creation order as secondary sort, because sorting is mainly invoked
+        # from the GUI and path makes more sense
+        order_by = with_tiebreakers(order_by, "hierarchy.path", "tasks.name")
 
-    ordering, paging_conds, cursor = create_pagination(
-        order_by,
-        first,
-        after,
-        last,
-        before,
-    )
-    sql_conditions.append(paging_conds)
+    ordering = ""
+    cursor = "''"
+    if not calculate_statistics and not calculate_specific_statistics:
+        ordering, paging_conds, cursor = create_pagination(
+            order_by,
+            first,
+            after,
+            last,
+            before,
+        )
+        sql_conditions.append(paging_conds)
 
     #
     # Query
@@ -540,27 +525,66 @@ async def get_tasks(
 
     if sql_cte:
         cte = ", ".join(sql_cte)
-        cte = f"WITH {cte}"
+        # RECURSIVE (harmless for the non-recursive CTEs here) is required
+        # when folder_ids+includeFolderChildren adds create_child_folder_ctes'
+        # self-referencing CTE.
+        cte = f"WITH RECURSIVE {cte}"
     else:
         cte = ""
 
     sql_columns.insert(0, cursor)
     sql_columns_str = ",\n".join(sql_columns)
 
+    default_columns_metadata: list[ColumnMetadata] = [
+        ColumnMetadata("name", "string"),
+        ColumnMetadata("label", "string"),
+        ColumnMetadata("task_type", "string"),
+        ColumnMetadata("thumbnail_id", "uuid"),
+        ColumnMetadata("active", "bool"),
+        ColumnMetadata("status", "string"),
+    ]
+
+    stats_select_clause = None
+    if calculate_specific_statistics:
+        stats_select_clause = generate_specific_stats_columns(
+            calculate_specific_statistics
+        )
+    elif calculate_statistics:
+        stats_select_clause = generate_stats_columns(default_columns_metadata)
+
+    raw_data_start = ""
+    raw_data_end = ""
+    if stats_select_clause:
+        cte_prefix = ",\n" if cte else "WITH"
+        raw_data_start = f"{cte_prefix} raw_data AS ("
+        raw_data_end = f"""
+        )
+        SELECT
+            {stats_select_clause}
+        FROM raw_data;
+        """
+
     query = f"""
-{cte}
-SELECT
-{sql_columns_str}
-FROM project_{project_name}.tasks AS tasks
-{" ".join(sql_joins)}
-{SQLTool.conditions(sql_conditions)}
-{ordering}
+        {cte}
+        {raw_data_start}
+        SELECT
+        {sql_columns_str}
+        FROM project_{project_name}.tasks AS tasks
+        {" ".join(sql_joins)}
+        {SQLTool.conditions(sql_conditions)}
+        {ordering}
+        {raw_data_end}
     """
 
-    # Keep it here for debugging :)
-    # from ayon_server.logging import logger
-    #
-    # logger.debug(f"Task query\n{query}")
+    # print()
+    # print("Tasks query:")
+    # print(query)
+    # print()
+
+    if stats_select_clause:
+        field_stats = await generate_field_stats(query)
+
+        return TasksConnection(edges=[], field_stats=field_stats)
 
     return await resolve(
         TasksConnection,

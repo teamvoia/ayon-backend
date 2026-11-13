@@ -1,20 +1,21 @@
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
+from strawberry.scalars import JSON
 
 from ayon_server.activities.activity_categories import ActivityCategories
 from ayon_server.exceptions import ForbiddenException
 from ayon_server.graphql.types import Info
+from ayon_server.lib.postgres import Postgres
 from ayon_server.utils import json_dumps, json_loads, slugify
 
 if TYPE_CHECKING:
     from ayon_server.graphql.nodes.user import UserNode
     from ayon_server.graphql.nodes.version import VersionNode
 else:
-    UserNode = LazyType["UserNode", ".user"]
-    VersionNode = LazyType["VersionNode", ".version"]
+    UserNode = Annotated["UserNode", strawberry.lazy(".user")]
+    VersionNode = Annotated["VersionNode", strawberry.lazy(".version")]
 
 
 @strawberry.type
@@ -41,6 +42,9 @@ class ActivityFileNode:
     author: str | None = strawberry.field()
     name: str | None = strawberry.field()
     mime: str | None = strawberry.field()
+    media_info: JSON | None = strawberry.field(
+        default=None, description="Media info extracted from the file"
+    )
     created_at: datetime = strawberry.field()
     updated_at: datetime = strawberry.field()
 
@@ -139,7 +143,7 @@ class ActivityNode:
                 record = {
                     "name": author,
                     "attrib": {
-                        "fullName": author,
+                        "fullName": data.get("authorFullName", author),
                     },
                     "active": False,
                     "deleted": True,
@@ -160,7 +164,7 @@ class ActivityNode:
         return None
 
     @strawberry.field
-    async def version(self, info: Info) -> Optional["VersionNode"]:
+    async def version(self, info: Info) -> VersionNode | None:
         if self.activity_type not in ["version.publish", "reviewable"]:
             return None
 
@@ -170,7 +174,12 @@ class ActivityNode:
             return None
 
         loader = info.context["version_loader"]
-        record = await loader.load((self.project_name, version_id))
+        try:
+            record = await loader.load((self.project_name, version_id))
+        except Postgres.UndefinedTableError:
+            # The inbox lists activities of all projects and resolves this
+            # after its project lock is released: the project was deleted
+            return None
         if record is None:
             return None
         return await info.context["version_from_record"](
@@ -192,6 +201,7 @@ class ActivityNode:
                     size=str(file.get("size", "0")),
                     author=file.get("author"),
                     mime=file.get("mime"),
+                    media_info=file.get("mediaInfo"),
                     created_at=file["created_at"],
                     updated_at=file["updated_at"],
                 )
@@ -239,6 +249,7 @@ async def activity_from_record(
     tags = record.pop("tags", [])
     category = None
     if category_name := activity_data.get("category"):
+        category_name = category_name.strip()
         # use get here - inbox won't have categories in context
         cdata = context.get("activity_categories", {}).get(category_name)
         category = ActivityCategory(

@@ -1,9 +1,10 @@
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter
 
 from ayon_server.api.dependencies import CurrentUser
 from ayon_server.api.responses import EmptyResponse
+from ayon_server.entities import ProjectEntity
 from ayon_server.exceptions import (
     BadRequestException,
     ForbiddenException,
@@ -11,6 +12,7 @@ from ayon_server.exceptions import (
 )
 from ayon_server.lib.postgres import Postgres
 from ayon_server.settings.anatomy import Anatomy
+from ayon_server.settings.json_schema import SettingsJsonSchemaGenerator
 from ayon_server.settings.postprocess import postprocess_settings_schema
 from ayon_server.types import Field, OPModel
 
@@ -44,8 +46,21 @@ async def get_anatomy_schema(user: CurrentUser) -> dict[str, Any]:
     The schema is used to display the anatomy preset editor form.
     """
 
-    schema = Anatomy.schema()
+    schema = Anatomy.model_json_schema()
     await postprocess_settings_schema(schema, Anatomy)
+
+    # Project attributes are configured at runtime, so their form
+    # is created from the current project attribute model
+    attrib_model = ProjectEntity.model.attrib_model
+    attrib_schema = attrib_model.model_json_schema(
+        schema_generator=SettingsJsonSchemaGenerator
+    )
+    await postprocess_settings_schema(attrib_schema, attrib_model, is_top_level=False)
+    schema["definitions"]["ProjectAttribModel"] = attrib_schema
+    prop = schema["properties"]["attributes"]
+    prop.pop("type", None)
+    prop.pop("additionalProperties", None)
+    prop["allOf"] = [{"$ref": "#/definitions/ProjectAttribModel"}]
     return schema
 
 
@@ -54,7 +69,11 @@ async def get_anatomy_presets(user: CurrentUser) -> AnatomyPresetListModel:
     """Return a list of stored anatomy presets."""
 
     presets = []
-    query = "SELECT * from anatomy_presets ORDER BY name, version"
+    query = """
+        SELECT name, is_primary, version
+        FROM anatomy_presets
+        ORDER BY name, version
+        """
     async for row in Postgres.iterate(query):
         presets.append(
             AnatomyPresetListItem(
@@ -124,8 +143,8 @@ async def update_anatomy_preset(
         """,
         preset_name,
         VERSION,
-        preset.dict(),
-        preset.dict(),
+        preset.model_dump(),
+        preset.model_dump(),
     )
     return EmptyResponse()
 
@@ -171,11 +190,13 @@ async def unset_primary_preset(preset_name: str, user: CurrentUser) -> EmptyResp
 
 
 class RenamePresetModel(OPModel):
-    name: str = Field(
-        ...,
-        title="New name of the anatomy preset",
-        description="The new name of the anatomy preset.",
-    )
+    name: Annotated[
+        str,
+        Field(
+            title="New name of the anatomy preset",
+            description="The new name of the anatomy preset.",
+        ),
+    ]
 
 
 @router.post("/presets/{preset_name}/rename", status_code=204)

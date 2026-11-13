@@ -1,9 +1,7 @@
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
 
-from ayon_server.entities import RepresentationEntity
 from ayon_server.graphql.nodes.common import BaseNode
 from ayon_server.graphql.types import Info
 from ayon_server.utils import get_base_name, json_dumps
@@ -11,7 +9,7 @@ from ayon_server.utils import get_base_name, json_dumps
 if TYPE_CHECKING:
     from ayon_server.graphql.nodes.version import VersionNode
 else:
-    VersionNode = LazyType["VersionNode", ".version"]
+    VersionNode = Annotated["VersionNode", strawberry.lazy(".version")]
 
 
 @strawberry.type
@@ -22,11 +20,6 @@ class FileNode:
     hash: str | None = None
     size: str = "0"
     hash_type: str = "md5"
-
-
-@RepresentationEntity.strawberry_attrib()
-class RepresentationAttribType:
-    pass
 
 
 @strawberry.type
@@ -64,10 +57,6 @@ class RepresentationNode(BaseNode):
         default=None,
         description="JSON serialized context data",
     )
-
-    @strawberry.field
-    def attrib(self) -> RepresentationAttribType:
-        return RepresentationAttribType(**self.processed_attrib())
 
     @strawberry.field()
     def parents(self) -> list[str]:

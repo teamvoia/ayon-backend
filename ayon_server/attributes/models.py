@@ -1,6 +1,6 @@
 from typing import Annotated, Any, Literal
 
-from pydantic import validator
+from pydantic import field_validator
 
 from ayon_server.enum.enum_item import EnumItem
 from ayon_server.types import (
@@ -128,9 +128,27 @@ class AttributeData(OPModel):
             title="Inherit",
             description="Inherit the attribute value from the parent entity.",
         ),
-    ] = True
+    ] = False
 
-    @validator("enum")
+    widget: Annotated[
+        str | None,
+        Field(
+            title="Widget",
+            description="Specific widget style this field should use.",
+        ),
+    ] = None
+    # future proofing
+    widget_settings: Annotated[
+        dict[str, Any] | None,
+        Field(
+            title="Widget Settings",
+            description="Any additional config specific for the widget style."
+            "(Date formats, precision etc.)",
+        ),
+    ] = None
+
+    @field_validator("enum")
+    @classmethod
     def validate_enum(cls, value: list[EnumItem] | None) -> list[EnumItem] | None:
         if value == []:
             return None

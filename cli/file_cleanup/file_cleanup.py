@@ -1,15 +1,16 @@
 import sqlite3
 
 from ayon_server.cli import app
-from ayon_server.files import Storages
 from ayon_server.helpers.project_list import get_project_list
 from ayon_server.initialize import ayon_init
 from ayon_server.lib.postgres import Postgres
-from nxtools import logging
+from ayon_server.logging import logger as logging
 
 
 async def cleanup_project_files(project_name: str, *, dry_run: bool) -> None:
     logging.info(f"Cleaning up files for project: {project_name}")
+    from ayon_server.files import Storages
+
     storage = await Storages.project(project_name)
 
     # Create an SQLite database in memory

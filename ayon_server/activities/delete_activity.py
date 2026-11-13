@@ -17,6 +17,7 @@ async def delete_activity(
     is_admin: bool = False,
     sender: str | None = None,
     sender_type: str | None = None,
+    create_events: bool = True,
 ) -> None:
     """Delete an activity.
 
@@ -44,7 +45,7 @@ async def delete_activity(
 
         if user_name and not is_admin:
             data = res[0]["data"]
-            if "author" in data and data["author"] != user_name:
+            if data.get("author") != user_name:
                 raise ForbiddenException("You are not the author of this activity")
         activity_type = res[0]["activity_type"]
 
@@ -90,16 +91,16 @@ async def delete_activity(
         )
 
         # Notify the front-end about the deleted activity
-
-        await EventStream.dispatch(
-            "activity.deleted",
-            project=project_name,
-            description=f"Deleted {activity_type} activity",
-            summary=summary,
-            store=activity_type not in DO_NOT_TRACK_ACTIVITIES,
-            user=user_name,
-            sender=sender,
-            sender_type=sender_type,
-        )
+        if create_events:
+            await EventStream.dispatch(
+                "activity.deleted",
+                project=project_name,
+                description=f"Deleted {activity_type} activity",
+                summary=summary,
+                store=activity_type not in DO_NOT_TRACK_ACTIVITIES,
+                user=user_name,
+                sender=sender,
+                sender_type=sender_type,
+            )
 
     return None

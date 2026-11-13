@@ -1,14 +1,15 @@
-from fastapi import BackgroundTasks
-
 from ayon_server.api.dependencies import (
     CurrentUser,
     ProjectName,
     RepresentationID,
-    Sender,
-    SenderType,
 )
 from ayon_server.api.responses import EmptyResponse, EntityIdResponse
 from ayon_server.entities import RepresentationEntity
+from ayon_server.entities.models.representation import (
+    RepresentationModel,
+    RepresentationPatchModel,
+    RepresentationPostModel,
+)
 from ayon_server.operations.project_level import ProjectLevelOperations
 
 from .router import router
@@ -26,7 +27,7 @@ async def get_representation(
     user: CurrentUser,
     project_name: ProjectName,
     representation_id: RepresentationID,
-) -> RepresentationEntity.model.main_model:  # type: ignore
+) -> RepresentationModel:
     """Retrieve a representation by its ID."""
 
     representation = await RepresentationEntity.load(project_name, representation_id)
@@ -39,27 +40,16 @@ async def get_representation(
 #
 
 
-@router.post(
-    "/projects/{project_name}/representations",
-    status_code=201,
-    response_model=EntityIdResponse,
-)
+@router.post("/projects/{project_name}/representations", status_code=201)
 async def create_representation(
-    post_data: RepresentationEntity.model.post_model,  # type: ignore
+    post_data: RepresentationPostModel,
     user: CurrentUser,
     project_name: ProjectName,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EntityIdResponse:
     """Create a new representation."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
-    ops.create("representation", **post_data.dict(exclude_unset=True))
+    ops = ProjectLevelOperations(project_name, user=user)
+    ops.create("representation", **post_data.model_dump(exclude_unset=True))
     res = await ops.process(can_fail=False, raise_on_error=True)
     entity_id = res.operations[0].entity_id
     return EntityIdResponse(id=entity_id)
@@ -74,26 +64,18 @@ async def create_representation(
     "/projects/{project_name}/representations/{representation_id}", status_code=204
 )
 async def update_representation(
-    post_data: RepresentationEntity.model.patch_model,  # type: ignore
-    background_tasks: BackgroundTasks,
+    post_data: RepresentationPatchModel,
     user: CurrentUser,
     project_name: ProjectName,
     representation_id: RepresentationID,
-    sender: Sender,
-    sender_type: SenderType,
 ):
     """Patch (partially update) a representation."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
     ops.update(
         "representation",
         representation_id,
-        **post_data.dict(exclude_unset=True),
+        **post_data.model_dump(exclude_unset=True),
     )
     await ops.process(can_fail=False, raise_on_error=True)
     return EmptyResponse()
@@ -108,21 +90,13 @@ async def update_representation(
     "/projects/{project_name}/representations/{representation_id}", status_code=204
 )
 async def delete_representation(
-    background_tasks: BackgroundTasks,
     user: CurrentUser,
     project_name: ProjectName,
     representation_id: RepresentationID,
-    sender: Sender,
-    sender_type: SenderType,
 ):
     """Delete a representation."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
     ops.delete("representation", representation_id)
     await ops.process(can_fail=False, raise_on_error=True)
     return EmptyResponse()

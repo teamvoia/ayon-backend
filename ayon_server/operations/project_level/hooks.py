@@ -13,6 +13,7 @@ from .models import OperationModel
 class HookResult(BaseModel):
     message: str | None = None
     triggers: list[str] | None = None
+    calculated_attributes: list[str] | None = None
 
 
 HookType = Callable[
@@ -49,7 +50,9 @@ class OperationHooks:
     In both cases, hook should not modify the entity, but the operation data
     (operation.data) or raise exceptions to prevent the operation.
 
-    Handling Hook result is not yet implemented.
+    Attributes returned in HookResult.calculated_attributes are writable for
+    this update even when the user's attribute-write whitelist excludes them.
+    Only return attributes calculated by the hook.
     """
 
     _hooks: dict[str, HookType] = {}

@@ -1,13 +1,13 @@
-from datetime import datetime
-from typing import Any
+from typing import Any, get_args
 
 from ayon_server.activities import (
-    ActivityType,
+    ActivityPatchModel,
+    ProjectActivityPostModel,
     create_activity,
     delete_activity,
     update_activity,
 )
-from ayon_server.api.dependencies import CurrentUser, ProjectName, Sender, SenderType
+from ayon_server.api.dependencies import CurrentUser, ProjectName
 from ayon_server.entities import UserEntity
 from ayon_server.exceptions import (
     AyonException,
@@ -15,47 +15,11 @@ from ayon_server.exceptions import (
     ForbiddenException,
 )
 from ayon_server.helpers.get_entity_class import get_entity_class
-from ayon_server.types import Field, OPModel
+from ayon_server.types import Field, OPModel, ProjectLevelEntityType
 from ayon_server.utils import create_uuid
 
 from .common import OperationType
 from .router import router
-
-# Payload models: this is just a copy of the models from api/activities/activity.py
-# TODO: refactor - move these models to a shared location
-
-
-class ProjectActivityPostModel(OPModel):
-    id: str | None = Field(None, description="Explicitly set the ID of the activity")
-    activity_type: ActivityType = Field(..., example="comment")
-    body: str = Field("", example="This is a comment")
-    files: list[str] | None = Field(None, example=["file1", "file2"])
-    timestamp: datetime | None = Field(None, example="2021-01-01T00:00:00Z")
-    data: dict[str, Any] | None = Field(
-        None,
-        example={"key": "value"},
-        description="Additional data",
-    )
-
-
-class ActivityPatchModel(OPModel):
-    body: str | None = Field(
-        None,
-        example="This is a comment",
-        description="When set, update the activity body",
-    )
-    files: list[str] | None = Field(
-        None,
-        example=["file1", "file2"],
-        description="When set, update the activity files",
-    )
-    append_files: bool = Field(
-        False,
-        example=False,
-        description="When true, append files to the existing ones. replace them otherwise",  # noqa: E501
-    )
-    data: dict[str, Any] | None = Field(None, example={"key": "value"})
-
 
 # Request/response models
 
@@ -146,8 +110,6 @@ async def process_activity_operation(
     project_name: str,
     operation: ActivityOperationModel,
     user: UserEntity,
-    sender: str | None = None,
-    sender_type: str | None = None,
 ) -> ActivityOperationResponseModel:
     if operation.type == "create":
         if not operation.data:
@@ -164,7 +126,10 @@ async def process_activity_operation(
                     "Only service users can create activities of this type"
                 )
 
-        entity_class = get_entity_class(operation.data["entityType"])
+        entity_type: str = operation.data.get("entityType") or ""
+        if entity_type not in get_args(ProjectLevelEntityType):
+            raise BadRequestException(f"Invalid entity type: {entity_type}")
+        entity_class = get_entity_class(entity_type)
         entity_id = operation.data.get("entityId", "").replace("-", "")
         if not len(entity_id) == 32:
             raise BadRequestException("Invalid entity ID")
@@ -177,10 +142,8 @@ async def process_activity_operation(
                 activity_type=activity.activity_type,
                 body=activity.body,
                 files=activity.files,
-                user_name=user.name,
+                user=user,
                 timestamp=activity.timestamp,
-                sender=sender,
-                sender_type=sender_type,
                 data=activity.data,
             )
         except Exception as e:
@@ -213,8 +176,6 @@ async def process_activity_operation(
                 append_files=patch.append_files,
                 user_name=user.name,
                 is_admin=user.is_admin,
-                sender=sender,
-                sender_type=sender_type,
                 data=patch.data,
             )
         except Exception as e:
@@ -236,8 +197,6 @@ async def process_activity_operation(
                 operation.activity_id,
                 user_name=user.name,
                 is_admin=user.is_admin,
-                sender=sender,
-                sender_type=sender_type,
             )
         except Exception as e:
             raise AyonException(str(e))
@@ -257,8 +216,6 @@ async def activities_operations(
     user: CurrentUser,
     project_name: ProjectName,
     payload: ActivityOperationsRequestModel,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> ActivityOperationsResponseModel:
     """
     Perform multiple operations on activities.
@@ -279,8 +236,6 @@ async def activities_operations(
                 project_name,
                 operation,
                 user,
-                sender,
-                sender_type,
             )
         except AyonException as e:
             response = ActivityOperationResponseModel(

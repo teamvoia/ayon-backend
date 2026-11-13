@@ -1,14 +1,24 @@
 __all__ = ["logger", "log_traceback", "critical_error"]
 
+import importlib.util
 import os
 import sys
+import sysconfig
 import time
 import traceback
-from typing import TypedDict
+import warnings
+from types import FrameType
+from typing import NotRequired, TypedDict
 
 from loguru import logger as loguru_logger
+from pydantic.warnings import PydanticDeprecationWarning
 
 from ayon_server.config import ayonconfig
+from ayon_server.deprecations import (
+    is_addon_path,
+    is_deprecation,
+    record_deprecation,
+)
 from ayon_server.utils import indent, json_dumps
 
 CONTEXT_KEY_BLACKLIST = {"nodb", "traceback"}
@@ -84,25 +94,176 @@ logger.remove(0)
 logger.add(_serializer, level=ayonconfig.log_level)
 
 
+#
+# Python warnings
+#
+# Warnings (deprecations from Pydantic, FastAPI, AYON itself...) are
+# routed to the AYON logger. The reported location is the first frame
+# in AYON or addon code, so warnings raised deep inside libraries point
+# to the line that needs to be fixed.
+#
+# Deprecations are collected in ayon_server.deprecations. The ones
+# caused by addons are not logged at all.
+#
+
+_AYON_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Library paths, which are never reported as a warning location
+_LIBRARY_PATHS = tuple(
+    {sysconfig.get_path("stdlib"), sysconfig.get_path("platstdlib")} - {None}
+)
+
+# AYON modules, that only pass arguments to Pydantic / FastAPI
+# or import addon modules. Warnings are reported at their caller.
+_AYON_PLUMBING = {
+    os.path.join(_AYON_SERVER_DIR, *path.split("/"))
+    for path in (
+        "logging.py",
+        "helpers/modules.py",
+        "models/metaclass.py",
+        "models/rest_model.py",
+        "settings/common.py",
+        "settings/pydantic_compat.py",
+        "settings/settings_field.py",
+    )
+}
+
+
+def _module_path(name: str) -> str:
+    """Return the directory of a package or the file of a single-file module"""
+    spec = importlib.util.find_spec(name)
+    assert spec and spec.origin, f"Module {name} not found"
+    if spec.submodule_search_locations:
+        return os.path.join(spec.submodule_search_locations[0], "")
+    return spec.origin
+
+
+# Libraries, which report the misuse of their API by the caller.
+# Warnings raised in them are reported at the first AYON or addon frame.
+# Warnings raised in other libraries are caused by the library itself.
+_CALLER_BLAMING_PATHS = (
+    "<frozen importlib",  # deprecated modules and module attributes
+    *(_module_path(name) for name in ("fastapi", "pydantic", "typing_extensions")),
+)
+
+_reported_warnings: set[tuple[str, int, str, str]] = set()
+
+
+def _is_library_code(filename: str) -> bool:
+    return (
+        filename.startswith("<")  # <frozen importlib._bootstrap> etc.
+        or "site-packages" in filename
+        or "dist-packages" in filename
+        or filename.startswith(_LIBRARY_PATHS)
+        or filename in _AYON_PLUMBING
+    )
+
+
+def _warning_location(filename: str, lineno: int) -> tuple[str, int] | None:
+    """Return the location of the code, which caused the warning.
+
+    Returns None if the warning did not originate from AYON or addon code.
+    """
+    if not _is_library_code(filename):
+        return filename, lineno
+
+    if filename not in _AYON_PLUMBING and not filename.startswith(
+        _CALLER_BLAMING_PATHS
+    ):
+        return None
+
+    frame: FrameType | None = sys._getframe(1)
+    while frame is not None:
+        if not _is_library_code(frame.f_code.co_filename):
+            return frame.f_code.co_filename, frame.f_lineno
+        frame = frame.f_back
+    return None
+
+
+def _log_warning(
+    message: Warning | str,
+    category: type[Warning],
+    filename: str,
+    lineno: int,
+    file=None,
+    line: str | None = None,
+) -> None:
+    if isinstance(message, PydanticDeprecationWarning):
+        # Without the "Deprecated in Pydantic V2.0..." suffix
+        text = message.message
+    else:
+        text = str(message)
+
+    location = _warning_location(filename, lineno)
+    if location is None:
+        # Only a library is to blame. Nothing we can fix
+        path, lineno = filename, lineno
+        log_method = logger.debug
+    else:
+        path, lineno = location
+        log_method = logger.warning
+
+    if location and is_deprecation(category, text):
+        is_new = record_deprecation(category.__name__, text, path, lineno)
+        if not is_new or is_addon_path(path):
+            # Addon deprecations are only reported by /api/system/deprecations
+            # to keep the log readable. Summary is logged by AddonLibrary.
+            return
+    else:
+        key = (path, lineno, category.__name__, text)
+        if key in _reported_warnings:
+            return
+        _reported_warnings.add(key)
+
+    path = path.removeprefix(f"{os.getcwd()}/")
+    text = f"{category.__name__}: {text} at {path}:{lineno}"
+    log_method(
+        text.replace("{", "{{").replace("}", "}}"),
+        module="warnings",
+    )
+
+
+warnings.showwarning = _log_warning
+
+
+def _controls_deprecations(option: str) -> bool:
+    """Return True if a -W option (action:message:category:module:lineno)
+    applies to deprecation warnings."""
+    parts = option.split(":")
+    category = parts[2].strip() if len(parts) > 2 else ""
+    return category in ("", "Warning") or category.endswith("DeprecationWarning")
+
+
+if not sys.warnoptions:
+    # Report each warning (including deprecations, which Python hides
+    # by default) once per location, where it originates.
+    # Duplicates are filtered in _log_warning.
+    warnings.simplefilter("always")
+    for category in (PendingDeprecationWarning, ImportWarning, ResourceWarning):
+        warnings.filterwarnings("ignore", category=category)
+
+elif not any(_controls_deprecations(option) for option in sys.warnoptions):
+    # Warning options (-W, PYTHONWARNINGS) are set, but not for deprecations.
+    # Python hides them by default, which would leave the deprecation
+    # registry empty.
+    warnings.filterwarnings("always", category=DeprecationWarning)
+
+
 class ExceptionInfo(TypedDict):
     status: int
     detail: str
-    traceback: str | None
+    traceback: NotRequired[str | None]
 
 
-def log_exception(
-    exc: BaseException,
-    message: str | None = None,
-    **kwargs,
-) -> ExceptionInfo:
-    """Log an exception with its traceback."""
-
-    path_prefix = f"{os.getcwd()}/"
+def _format_exception_only(exc: BaseException) -> str:
     formatted = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-    formatted = formatted.replace("{", "{{").replace("}", "}}")
-    tb = traceback.extract_tb(exc.__traceback__)
-    traceback_msg = f"{formatted}\n\n"
-    for frame in tb[-20:]:
+    return formatted.replace("{", "{{").replace("}", "}}")
+
+
+def _format_traceback(exc: BaseException) -> str:
+    path_prefix = f"{os.getcwd()}/"
+    traceback_msg = f"{_format_exception_only(exc)}\n\n"
+    for frame in traceback.extract_tb(exc.__traceback__)[-20:]:
         fpath = frame.filename.split("/")
         for p in ("starlette", "fastapi", "python3.11", "pydantic"):
             # Too noisy. ignore
@@ -112,6 +273,34 @@ def log_exception(
             filepath = frame.filename.removeprefix(path_prefix)
             traceback_msg += f"{filepath}:{frame.lineno}\n"
             traceback_msg += f"{frame.line}\n\n"
+    return traceback_msg.strip()
+
+
+def log_exception(
+    exc: BaseException,
+    message: str | None = None,
+    **kwargs,
+) -> ExceptionInfo:
+    """Log an exception with its traceback."""
+
+    formatted = _format_exception_only(exc)
+    traceback_msg = _format_traceback(exc)
+
+    # Include chained exceptions, so the root cause is not lost when
+    # an exception is raised while handling another one
+    seen = {id(exc)}
+    chained: BaseException | None = exc
+    while chained is not None:
+        if chained.__cause__ is not None:
+            chained, label = chained.__cause__, "Caused by"
+        elif chained.__context__ is not None and not chained.__suppress_context__:
+            chained, label = chained.__context__, "During handling of"
+        else:
+            break
+        if id(chained) in seen:
+            break
+        seen.add(id(chained))
+        traceback_msg += f"\n\n{label}:\n\n{_format_traceback(chained)}"
 
     if message is None:
         message = f"Unhandled exception: {formatted}"
