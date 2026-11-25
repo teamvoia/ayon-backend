@@ -1,14 +1,15 @@
-from fastapi import BackgroundTasks, Query
+from fastapi import Query
 
-from ayon_server.api.dependencies import (
-    CurrentUser,
-    FolderID,
-    ProjectName,
-    Sender,
-    SenderType,
-)
+from ayon_server.api.dependencies import CurrentUser, FolderID, ProjectName
 from ayon_server.api.responses import EmptyResponse, EntityIdResponse
 from ayon_server.entities import FolderEntity
+from ayon_server.entities.models.folder import (
+    FolderModel,
+    FolderPatchModel,
+    FolderPostModel,
+)
+from ayon_server.exceptions import BadRequestException
+from ayon_server.helpers.hierarchy_cache import AYON_INTERNAL_FOLDER_NAME
 from ayon_server.operations.project_level import ProjectLevelOperations
 
 from .router import router
@@ -23,7 +24,7 @@ async def get_folder(
     user: CurrentUser,
     project_name: ProjectName,
     folder_id: FolderID,
-) -> FolderEntity.model.main_model:  # type: ignore
+) -> FolderModel:
     """Retrieve a folder by its ID."""
 
     folder = await FolderEntity.load(project_name, folder_id)
@@ -38,23 +39,18 @@ async def get_folder(
 
 @router.post("", status_code=201)
 async def create_folder(
-    post_data: FolderEntity.model.post_model,  # type: ignore
-    background_tasks: BackgroundTasks,
+    post_data: FolderPostModel,
     user: CurrentUser,
     project_name: ProjectName,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EntityIdResponse:
     """Create a new folder."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    if post_data.name.startswith(AYON_INTERNAL_FOLDER_NAME):
+        raise BadRequestException("Reserved folder name")
 
-    ops.create("folder", **post_data.dict(exclude_unset=True))
+    ops = ProjectLevelOperations(project_name, user=user)
+
+    ops.create("folder", **post_data.model_dump(exclude_unset=True))
     res = await ops.process(can_fail=False, raise_on_error=True)
     folder_id = res.operations[0].entity_id
     assert folder_id is not None, "Folder ID is None. This should never happen."
@@ -68,13 +64,10 @@ async def create_folder(
 
 @router.patch("/{folder_id}", status_code=204)
 async def update_folder(
-    post_data: FolderEntity.model.patch_model,  # type: ignore
-    background_tasks: BackgroundTasks,
+    post_data: FolderPatchModel,
     user: CurrentUser,
     project_name: ProjectName,
     folder_id: FolderID,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Patch (partially update) a folder.
 
@@ -82,13 +75,11 @@ async def update_folder(
     cannot be changed.
     """
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
-    ops.update("folder", folder_id, **post_data.dict(exclude_unset=True))
+    if post_data.name and post_data.name.startswith(AYON_INTERNAL_FOLDER_NAME):
+        raise BadRequestException("Reserved folder name")
+
+    ops = ProjectLevelOperations(project_name, user=user)
+    ops.update("folder", folder_id, **post_data.model_dump(exclude_unset=True))
     await ops.process(can_fail=False, raise_on_error=True)
     return EmptyResponse()
 
@@ -103,8 +94,6 @@ async def delete_folder(
     user: CurrentUser,
     project_name: ProjectName,
     folder_id: FolderID,
-    sender: Sender,
-    sender_type: SenderType,
     force: bool = Query(False, description="Allow recursive deletion"),
 ) -> EmptyResponse:
     """Delete a folder.
@@ -113,12 +102,12 @@ async def delete_folder(
     its subfolders. Otherwise, deletes the folder and all its subfolders.
     """
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
+
+    # If `force` is true, all subfolders, as well as any products in those folders,
+    # will be deleted. We don't need any additional ACL checks here,
+    # as they are performed in the delete operation (only managers and above can
+    # use this flag
 
     ops.delete("folder", folder_id, force=force)
     await ops.process(can_fail=False, raise_on_error=True)

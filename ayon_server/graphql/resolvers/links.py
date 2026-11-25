@@ -37,6 +37,7 @@ async def get_links(
     type_conditions = []
     if link_types is not None:
         for lt in link_types:
+            lt = lt.replace("'", "''")
             type_conditions.append(f"link_type LIKE '{lt}|%'")
         if type_conditions:
             sql_conditions.append(f"({' or '.join(type_conditions)})")
@@ -45,27 +46,35 @@ async def get_links(
         sql_conditions.append(f"creation_order > {after}")
 
     if names is not None:
+        names = [name.replace("'", "''") for name in names]
         sql_conditions.append(f"name in {SQLTool.array(names)}")
 
     if name_ex is not None:
+        name_ex = name_ex.replace("'", "''")
         sql_conditions.append(f"name ~ '{name_ex}'")
 
     query = f"""
-        SELECT id, name, input_id, output_id, link_type, author, data, created_at
+        SELECT
+            id,
+            name,
+            input_id,
+            output_id,
+            link_type,
+            author,
+            data,
+            created_at,
+            creation_order
         FROM project_{project_name}.links
         {SQLTool.conditions(sql_conditions)}
         ORDER BY creation_order
-        LIMIT {first}
+        LIMIT {first + 1}
     """
 
     async for row in Postgres.iterate(query):
-        if first <= len(edges):
-            break
-
         link_type, input_type, output_type = row["link_type"].split("|")
         input_id = row["input_id"]
         output_id = row["output_id"]
-        link_id = row["id"]
+        cursor = str(row["creation_order"])
 
         if root.id == output_id:
             direction = "in"
@@ -89,13 +98,16 @@ async def get_links(
                 entity_type=entity_type,
                 name=row["name"],
                 link_type=link_type,
-                cursor=link_id,
+                cursor=cursor,
                 description=description,
                 author=row["author"],
+                data=row["data"],
             )
         )
 
-    has_next_page = len(edges) >= first
+    has_next_page = len(edges) > first
+    if has_next_page:
+        edges = edges[:first]
     end_cursor = edges[-1].cursor if edges else None
 
     page_info = PageInfo(

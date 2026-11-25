@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from ayon_server.access.utils import folder_access_list
 from ayon_server.api.dependencies import CurrentUser, ProjectName
 from ayon_server.exceptions import BadRequestException
+from ayon_server.graphql.resolvers.common import get_resolved_attrib_expression
 from ayon_server.lib.postgres import Postgres
 from ayon_server.sqlfilter import QueryFilter, build_filter
 from ayon_server.types import Field, OPModel
@@ -74,7 +75,9 @@ async def query_tasks_folders(
                 table_prefix="tasks",
                 column_whitelist=ALLOWED_KEYS,
                 column_map={
-                    "attrib": "(coalesce(f.attrib, '{}'::jsonb ) || tasks.attrib)"
+                    "attrib": get_resolved_attrib_expression(
+                        "task", "tasks.attrib", inherited="f.attrib"
+                    )
                 },
             )
         except ValueError as e:
@@ -83,16 +86,21 @@ async def query_tasks_folders(
             conditions.append(filter)
 
     if request.search:
-        terms = slugify(request.search, make_set=True)
-        # isn't it nice that slugify effectively prevents sql injections?
-        for term in terms:
-            cond = f"""(
-            tasks.name ILIKE '{term}%'
-            OR tasks.label ILIKE '{term}%'
-            OR tasks.task_type ILIKE '{term}%'
-            OR f.path ILIKE '%{term}%'
-            )"""
-            conditions.append(cond)
+        parts = request.search.split(",")
+        t1_conds = []
+
+        for part in parts:
+            terms = slugify(part, make_set=True, split_chars=" ")
+            t2_conds = []
+            for term in terms:
+                t2_conds.append(
+                    f"(tasks.name ILIKE '%{term}%'"
+                    f"OR tasks.label ILIKE '%{term}%'"
+                    f"OR tasks.task_type ILIKE '%{term}%'"
+                    f"OR f.path ILIKE '%{term}%')"
+                )
+            t1_conds.append(SQLTool.conditions(t2_conds, "AND", add_where=False))
+        conditions.append(SQLTool.conditions(t1_conds, "OR", add_where=False))
 
     if not conditions:
         raise BadRequestException("No filter or search term provided")

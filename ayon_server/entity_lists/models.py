@@ -3,7 +3,7 @@ from enum import IntEnum
 from typing import Annotated, Any, Literal
 
 from ayon_server.types import Field, OPModel, ProjectLevelEntityType
-from ayon_server.utils import create_uuid, now
+from ayon_server.utils import EntityID, create_uuid, now
 
 
 class ListAccessLevel(IntEnum):
@@ -18,7 +18,7 @@ class ListAccessLevel(IntEnum):
 FListID = Field(
     default_factory=create_uuid,
     title="ID",
-    example=create_uuid(),
+    **EntityID.META,
 )
 FListLabel = Field(
     title="List label",
@@ -47,6 +47,7 @@ FListEntityType = Field(
 FFolderID = Field(
     title="List folder ID",
     description="ID of the folder containing the list",
+    **EntityID.META,
 )
 FListAccess = Field(
     title="Access",
@@ -84,12 +85,12 @@ FListActive = Field(
 FListItemId = Field(
     default_factory=create_uuid,
     title="Item ID",
-    example=create_uuid(),
+    **EntityID.META,
 )
 FListItemEntityId = Field(
     title="Entity ID",
     description="ID of the entity in the list",
-    example=create_uuid(),
+    **EntityID.META,
 )
 FListItemLabel = Field(
     title="Item label",
@@ -132,13 +133,13 @@ class EntityListItemModel(OPModel):
     id: Annotated[str, FListItemId]
     entity_id: Annotated[str, FListItemEntityId]
     position: Annotated[int, FListItemPosition]
-    label: Annotated[str | None, FListItemLabel]
+    label: Annotated[str | None, FListItemLabel] = None
     attrib: Annotated[dict[str, Any], FListItemAttrib]
     data: Annotated[dict[str, Any], FListItemData]
     tags: Annotated[list[str], FListItemTags]
     folder_path: Annotated[str, FListItemFolderPath]
-    created_by: Annotated[str | None, FCreatedBy]
-    updated_by: Annotated[str | None, FUpdatedBy]
+    created_by: Annotated[str | None, FCreatedBy] = None
+    updated_by: Annotated[str | None, FUpdatedBy] = None
     created_at: Annotated[datetime, FCreatedAt]
     updated_at: Annotated[datetime, FUpdatedAt]
 
@@ -146,8 +147,8 @@ class EntityListItemModel(OPModel):
 class EntityListItemPostModel(OPModel):
     id: Annotated[str, FListItemId]
     entity_id: Annotated[str, FListItemEntityId]
-    position: Annotated[int | None, FListItemPosition]
-    label: Annotated[str | None, FListItemLabel]
+    position: Annotated[int | None, FListItemPosition] = None
+    label: Annotated[str | None, FListItemLabel] = None
     attrib: Annotated[dict[str, Any], FListItemAttrib]
     data: Annotated[dict[str, Any], FListItemData]
     tags: Annotated[list[str], FListItemTags]
@@ -174,9 +175,9 @@ class EntityListModel(OPModel):
     template: Annotated[dict[str, Any], FListTemplate]
     tags: Annotated[list[str], FListTags]
     items: Annotated[list[EntityListItemModel], FListItems]
-    owner: Annotated[str | None, FListOwner]
-    created_by: Annotated[str | None, FCreatedBy]
-    updated_by: Annotated[str | None, FUpdatedBy]
+    owner: Annotated[str | None, FListOwner] = None
+    created_by: Annotated[str | None, FCreatedBy] = None
+    updated_by: Annotated[str | None, FUpdatedBy] = None
     created_at: Annotated[datetime, FCreatedAt]
     updated_at: Annotated[datetime, FUpdatedAt]
     active: Annotated[bool, FListActive]
@@ -212,9 +213,43 @@ class EntityListPatchModel(OPModel):
     active: Annotated[bool | None, FListActive] = None
 
 
+class EntityListDuplicatePostModel(OPModel):
+    id: Annotated[
+        str | None,
+        Field(
+            title="ID of the copy",
+            description="When omitted, a new ID is generated",
+            **EntityID.META,
+        ),
+    ] = None
+    label: Annotated[
+        str | None,
+        Field(
+            title="Label of the copy",
+            description=(
+                "When omitted, a free label is picked, "
+                "e.g. `My list (copy)`, then `My list (copy 2)`"
+            ),
+            example="My list (copy)",
+        ),
+    ] = None
+    entity_list_folder_id: Annotated[
+        str | None,
+        Field(
+            title="Folder ID of the copy",
+            description=(
+                "When omitted, the copy is placed in the folder of the source list. "
+                "Explicit `null` places it outside of any folder."
+            ),
+            **EntityID.META,
+        ),
+    ] = None
+
+
 class EntityListSummary(OPModel):
     id: Annotated[str, FListID]
     entity_list_type: Annotated[str, FListType]
+    entity_list_folder_id: Annotated[str | None, FFolderID] = None
     entity_type: Annotated[ProjectLevelEntityType, FListEntityType]
     label: Annotated[str, FListLabel]
     count: Annotated[int, Field(title="Item count", ge=0)] = 0

@@ -1,23 +1,26 @@
 from typing import Annotated
 
-from ayon_server.api.dependencies import CurrentUser, ProjectName
+from ayon_server.api.dependencies import CurrentUser, EntityListID, ProjectName
 from ayon_server.exceptions import NotFoundException
 from ayon_server.lib.postgres import Postgres
 from ayon_server.types import Field, OPModel, ProjectLevelEntityType
+from ayon_server.utils import EntityID
 
 from .router import router
 
 
 class EntityListEnities(OPModel):
     entity_type: Annotated[ProjectLevelEntityType, Field(title="Entity type")]
-    entity_ids: Annotated[list[str], Field(title="Entity IDs")]
+    entity_ids: Annotated[
+        list[Annotated[str, Field(**EntityID.META)]], Field(title="Entity IDs")
+    ]
 
 
-@router.get("/lists/{list_id}/entities")
+@router.get("/lists/{entity_list_id}/entities")
 async def get_list_entities(
     user: CurrentUser,
     project_name: ProjectName,
-    list_id: str,
+    entity_list_id: EntityListID,
 ) -> EntityListEnities:
     """Get the entities of a list."""
 
@@ -35,13 +38,13 @@ async def get_list_entities(
     entity_type: ProjectLevelEntityType | None = None
     entity_ids: set[str] = set()
 
-    async for row in Postgres.iterate(query, list_id):
+    async for row in Postgres.iterate(query, entity_list_id):
         entity_type = row["entity_type"]
         entity_ids.add(row["entity_id"])
 
     if entity_type is None:
         raise NotFoundException(
-            f"Entity list ID '{list_id}' not found",
+            f"Entity list ID '{entity_list_id}' not found",
         )
 
     return EntityListEnities(

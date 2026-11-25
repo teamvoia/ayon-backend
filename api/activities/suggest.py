@@ -1,4 +1,4 @@
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
 from ayon_server.api.dependencies import AllowGuests, CurrentUser, ProjectName
 from ayon_server.entities import FolderEntity, TaskEntity, VersionEntity
@@ -8,25 +8,28 @@ from ayon_server.suggestions.folder import get_folder_suggestions
 from ayon_server.suggestions.models import (
     SuggestionType,
     TaskSuggestionItem,
+    TeamSuggestionItem,
     UserSuggestionItem,
     VersionSuggestionItem,
 )
 from ayon_server.suggestions.task import get_task_suggestions
 from ayon_server.suggestions.version import get_version_suggestions
 from ayon_server.types import Field, OPModel
+from ayon_server.utils import EntityID
 
 from .router import router
 
 
 class SuggestRequest(OPModel):
-    entity_type: Literal["folder", "task", "version"] = Field(..., example="task")
-    entity_id: str = Field(..., example="af3e4b3e-1b1b-4b3b-8b3b-3b3b3b3b3b3b")
+    entity_type: Annotated[Literal["folder", "task", "version"], Field(example="task")]
+    entity_id: Annotated[str, Field(**EntityID.META)]
 
 
 class SuggestResponse(OPModel):
-    users: list[UserSuggestionItem] = Field(default_factory=list)
-    tasks: list[TaskSuggestionItem] = Field(default_factory=list)
-    versions: list[VersionSuggestionItem] = Field(default_factory=list)
+    users: Annotated[list[UserSuggestionItem], Field(default_factory=list)]
+    teams: Annotated[list[TeamSuggestionItem], Field(default_factory=list)]
+    tasks: Annotated[list[TaskSuggestionItem], Field(default_factory=list)]
+    versions: Annotated[list[VersionSuggestionItem], Field(default_factory=list)]
 
 
 @router.post("/suggest", response_model_exclude_none=True, dependencies=[AllowGuests])
@@ -43,7 +46,7 @@ async def suggest_entity_mention(
     """
 
     if user.is_guest:
-        return SuggestResponse()
+        return SuggestResponse(users=[], teams=[], tasks=[], versions=[])
 
     entity_class = get_entity_class(request.entity_type)
     entity = await entity_class.load(project_name, request.entity_id)

@@ -121,13 +121,14 @@ async def update_activity(
             )
 
         # Extract mentions from the body
-        mentions = extract_mentions(body)
+        mentions = await extract_mentions(body, project_name)
 
         refs_to_delete = []
         for ref in references:
             if ref.reference_type == "mention":
                 if ref not in mentions:
                     refs_to_delete.append(ref.id)
+        references = {ref for ref in references if ref.id not in refs_to_delete}
         references.update(mentions)
 
         # Update files

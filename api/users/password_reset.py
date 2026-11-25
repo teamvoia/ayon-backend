@@ -1,47 +1,35 @@
+import secrets
 import time
+from typing import Annotated
 
 from ayon_server.auth.models import LoginResponseModel
 from ayon_server.auth.session import Session
 from ayon_server.entities import UserEntity
 from ayon_server.exceptions import ForbiddenException
+from ayon_server.helpers.email import EmailTemplate
+from ayon_server.helpers.server_url import get_server_url
 from ayon_server.lib.postgres import Postgres
 from ayon_server.logging import logger
 from ayon_server.types import Field, OPModel
-from ayon_server.utils import create_hash
+from ayon_server.utils import hash_data
 
 from .router import router
 
 TOKEN_TTL = 3600
-PASSWORD_RESET_EMAIL_TEMPLATE_PLAIN = """
-Hello {name},
-it seems that you have requested a password reset for your account for Ayon.
-Please follow this link to reset your password:
-
-{reset_url}?token={token}
-"""
-
-PASSWORD_RESET_EMAIL_TEMPLATE_HTML = """
-<p>Hello, {name}</p>
-
-<p>it seems that you have requested a password reset for your account for Ayon.
-Please follow this link to reset your password:</p>
-
-<p><a href="{reset_url}?token={token}">Reset password</a></p>
-"""
 
 
 class PasswordResetRequestModel(OPModel):
-    email: str = Field(..., title="Email", example="you@somewhere.com")
-    url: str = Field(...)
+    email: Annotated[str, Field(title="Email", example="you@somewhere.com")]
+    # url: Annotated[str, Field(title="Password reset URL")]
 
 
 @router.post("/passwordResetRequest")
-async def password_reset_request(request: PasswordResetRequestModel):
+async def password_reset_request(payload: PasswordResetRequestModel):
     query = "SELECT name, data FROM users WHERE LOWER(attrib->>'email') = $1"
-    res = await Postgres.fetchrow(query, request.email.lower())
+    res = await Postgres.fetchrow(query, payload.email.lower())
     if res is None:
         logger.error(
-            f"Attempted password reset using non-existent email: {request.email}"
+            f"Attempted password reset using non-existent email: {payload.email}"
         )
         return
 
@@ -53,33 +41,44 @@ async def password_reset_request(request: PasswordResetRequestModel):
         if password_request_time and (time.time() - password_request_time) < 600:
             logger.error(
                 "Attempted password reset too soon "
-                f"after previous attempt for {request.email}"
+                f"after previous attempt for {payload.email}"
             )
             msg = "Attempted password reset too soon after previous attempt"
             raise ForbiddenException(msg)
 
-    token = create_hash()
+    # Never from the request: anyone could get the link sent to their own site
+    if (server_url := await get_server_url()) is None:
+        logger.error("Unable to send password reset email: server URL is not set")
+        return
+
+    token = secrets.token_urlsafe(32)
     password_reset_request = {
         "time": time.time(),
-        "token": token,
+        "token": hash_data(token),  # only the emailed link holds the token
     }
 
     user = await UserEntity.load(res["name"])
     user.data["passwordResetRequest"] = password_reset_request
 
     tplvars = {
-        "token": token,
-        "reset_url": request.url,
-        "name": user.attrib.fullName or user.name,
+        "reset_url": f"{server_url}/passwordReset?token={token}",
+        "full_name": user.attrib.fullName or user.name,
     }
+
+    template = EmailTemplate()
+    body = await template.render_template(
+        "password_reset.jinja",
+        tplvars,
+        base_url=server_url,
+    )
+    subject = "Ayon password reset request"
 
     await user.save()
     await user.send_mail(
-        "Ayon password reset",
-        text=PASSWORD_RESET_EMAIL_TEMPLATE_PLAIN.format(**tplvars),
-        html=PASSWORD_RESET_EMAIL_TEMPLATE_HTML.format(**tplvars),
+        subject=subject,
+        html=body,
     )
-    logger.info(f"Sent password reset email to {request.email}")
+    logger.info(f"Sent password reset email to {payload.email}")
 
 
 class PasswordResetModel(OPModel):
@@ -95,7 +94,7 @@ async def password_reset(request: PasswordResetModel) -> LoginResponseModel:
 
     ERROR_MESSAGE = "Invalid reset token or token has expired"
 
-    res = await Postgres.fetchrow(query, request.token)
+    res = await Postgres.fetchrow(query, hash_data(request.token))
     if res is None:
         logger.error("Attempted password reset using invalid token")
         raise ForbiddenException(ERROR_MESSAGE)

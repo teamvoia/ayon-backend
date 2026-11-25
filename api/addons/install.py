@@ -1,10 +1,11 @@
+import asyncio
 from datetime import datetime
 from typing import Literal
 
 import shortuuid
 from fastapi import BackgroundTasks, Query, Request
 
-from ayon_server.api.dependencies import CurrentUser
+from ayon_server.api.dependencies import CurrentUser, NoDelegatedAccess
 from ayon_server.api.files import handle_upload
 from ayon_server.constraints import Constraints
 from ayon_server.events import EventStream
@@ -27,7 +28,7 @@ class InstallAddonResponseModel(OPModel):
     event_id: str = Field(..., title="Event ID")
 
 
-@router.post("/install")
+@router.post("/install", dependencies=[NoDelegatedAccess])
 async def upload_addon_zip_file(
     background_tasks: BackgroundTasks,
     user: CurrentUser,
@@ -55,12 +56,14 @@ async def upload_addon_zip_file(
         if not allow_custom_addons:
             raise ForbiddenException("Custom addons uploads are not allowed")
 
-    temp_path = f"/tmp/{shortuuid.uuid()}.zip"
+    # Archive format (zip or tar) is detected from the content, not the extension
+    temp_path = f"/tmp/{shortuuid.uuid()}.addon"
     await handle_upload(request, temp_path)
 
     # Get addon name and version from the zip file
 
-    zip_info = get_addon_zip_info(temp_path)
+    # in a thread: listing a compressed tar reads the whole archive
+    zip_info = await asyncio.to_thread(get_addon_zip_info, temp_path)
     zip_info.zip_path = temp_path
 
     # We don't create the event before we know that the zip file is valid
@@ -72,7 +75,7 @@ async def upload_addon_zip_file(
         "addon.install",
         hash=event_hash,
         description=f"Installing addon {zip_info.name} {zip_info.version}",
-        summary=zip_info.dict(exclude_none=True),
+        summary=zip_info.model_dump(exclude_none=True),
         user=user.name,
         finished=False,
         reuse=True,

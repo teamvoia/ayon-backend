@@ -1,3 +1,7 @@
+-- This file runs on every setup. Statements that would lock existing
+-- tables (ALTER TABLE, CREATE INDEX IF NOT EXISTS) check the catalog first,
+-- so setup doesn't block or deadlock with a running server.
+
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 ALTER EXTENSION pg_trgm SET SCHEMA public;
 
@@ -15,12 +19,15 @@ CREATE TABLE IF NOT EXISTS public.server_updates(
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS server_updates_version_idx ON public.server_updates(version);
+DO $$ BEGIN IF to_regclass('public.server_updates_version_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS server_updates_version_idx ON public.server_updates(version);
+END IF; END $$;
 
 -- Projects
 
 CREATE TABLE IF NOT EXISTS public.projects(
     name VARCHAR NOT NULL PRIMARY KEY,
+    label VARCHAR,
     code VARCHAR NOT NULL,
     library BOOLEAN NOT NULL DEFAULT FALSE,
     config JSONB NOT NULL DEFAULT '{}'::JSONB,
@@ -32,8 +39,28 @@ CREATE TABLE IF NOT EXISTS public.projects(
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS projectname_idx ON public.projects(LOWER(name));
-CREATE UNIQUE INDEX IF NOT EXISTS projectcode_idx ON public.projects(LOWER(code));
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'public.projects'::regclass AND attname = 'label' AND NOT attisdropped
+  ) THEN
+    ALTER TABLE public.projects ADD COLUMN IF NOT EXISTS label VARCHAR;
+  END IF;
+END $$;
+
+DO $$ BEGIN IF to_regclass('public.projectname_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS projectname_idx ON public.projects(LOWER(name));
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.projectcode_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS projectcode_idx ON public.projects(LOWER(code));
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.projectlabel_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS projectlabel_idx ON public.projects(LOWER(label));
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.projectactive_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS projectactive_idx ON public.projects(active);
+END IF; END $$;
+
 
 CREATE TABLE IF NOT EXISTS project_folders (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -43,8 +70,32 @@ CREATE TABLE IF NOT EXISTS project_folders (
     data JSONB DEFAULT '{}'::JSONB
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_project_folder_parent_label 
+DO $$ BEGIN IF to_regclass('public.uq_project_folder_parent_label') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_project_folder_parent_label 
   ON project_folders(COALESCE(parent_id::varchar, ''), LOWER(label));
+END IF; END $$;
+
+
+CREATE TABLE IF NOT EXISTS project_skeleton_thumbnails(
+    project_name VARCHAR NOT NULL PRIMARY KEY 
+      REFERENCES public.projects(name) 
+      ON DELETE CASCADE ON UPDATE CASCADE,
+    mime VARCHAR NOT NULL,
+    data BYTEA NOT NULL,
+    meta JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_attribute
+    WHERE attrelid = 'public.project_skeleton_thumbnails'::regclass
+    AND attname = 'data' AND attstorage <> 'e'
+  ) THEN
+    ALTER TABLE public.project_skeleton_thumbnails ALTER COLUMN data SET STORAGE EXTERNAL;
+  END IF;
+END $$;
+
 
 -- Users
 
@@ -58,7 +109,9 @@ CREATE TABLE IF NOT EXISTS public.users(
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS username_idx ON public.users (LOWER(name));
+DO $$ BEGIN IF to_regclass('public.username_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS username_idx ON public.users (LOWER(name));
+END IF; END $$;
 
 
 -- Product types
@@ -88,9 +141,15 @@ CREATE TABLE IF NOT EXISTS views(
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS unique_working_view ON views(view_type, owner) WHERE working;
-CREATE INDEX IF NOT EXISTS view_type_idx ON views(view_type);
-CREATE INDEX IF NOT EXISTS view_owner_idx ON views(owner);
+DO $$ BEGIN IF to_regclass('public.unique_working_view') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS unique_working_view ON views(view_type, owner) WHERE working;
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.view_type_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS view_type_idx ON views(view_type);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.view_owner_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS view_owner_idx ON views(owner);
+END IF; END $$;
 
 ------------
 -- Events --
@@ -125,18 +184,56 @@ CREATE TABLE IF NOT EXISTS public.events(
   creation_order SERIAL NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS unique_event_hash ON events(hash);
-CREATE UNIQUE INDEX IF NOT EXISTS unique_creation_order ON events(creation_order);
+DO $$ BEGIN IF to_regclass('public.unique_event_hash') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS unique_event_hash ON events(hash);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.unique_creation_order') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS unique_creation_order ON events(creation_order);
+END IF; END $$;
 
-CREATE INDEX IF NOT EXISTS event_topic_idx ON events USING GIN (topic public.gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS event_depends_on_idx ON events(depends_on);
-CREATE INDEX IF NOT EXISTS event_project_name_idx ON events (project_name);
-CREATE INDEX IF NOT EXISTS event_user_name_idx ON events (user_name);
-CREATE INDEX IF NOT EXISTS event_created_at_idx ON events (created_at);
-CREATE INDEX IF NOT EXISTS event_updated_at_idx ON events (updated_at);
-CREATE INDEX IF NOT EXISTS event_status_idx ON events (status);
-CREATE INDEX IF NOT EXISTS event_retries_idx ON events (retries);
-CREATE INDEX IF NOT EXISTS events_sender_type_idx ON events(sender_type);
+DO $$ BEGIN IF to_regclass('public.event_topic_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_topic_idx ON events USING GIN (topic public.gin_trgm_ops);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.event_depends_on_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_depends_on_idx ON events(depends_on);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.event_project_name_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_project_name_idx ON events (project_name);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.event_user_name_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_user_name_idx ON events (user_name);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.event_created_at_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_created_at_idx ON events (created_at);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.event_updated_at_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_updated_at_idx ON events (updated_at);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.event_status_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_status_idx ON events (status);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.event_retries_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS event_retries_idx ON events (retries);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.events_sender_type_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS events_sender_type_idx ON events(sender_type);
+END IF; END $$;
+
+DO $$ BEGIN IF to_regclass('public.idx_events_excluded_lookup') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_events_excluded_lookup 
+  ON public.events (topic, updated_at)
+  INCLUDE (depends_on) WHERE depends_on IS NOT NULL AND status IN ('finished', 'failed');
+END IF; END $$;
+
+DO $$ BEGIN IF to_regclass('public.idx_events_source_processing') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_events_source_processing
+  ON public.events (topic, status, created_at);
+END IF; END $$;
+
+DO $$ BEGIN IF to_regclass('public.idx_events_target_lookup') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_events_target_lookup 
+  ON public.events (depends_on, topic);
+END IF; END $$;
 
 --------------
 -- Settings --
@@ -150,17 +247,26 @@ CREATE TABLE IF NOT EXISTS public.bundles(
   is_dev BOOLEAN NOT NULL DEFAULT FALSE,
   active_user VARCHAR REFERENCES public.users(name) ON DELETE SET NULL ON UPDATE CASCADE,
   data JSONB NOT NULL DEFAULT '{}'::JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- only one bundle per active user
-CREATE UNIQUE INDEX IF NOT EXISTS bundle_active_user_idx ON bundles(active_user) WHERE active_user IS NOT NULL;
+DO $$ BEGIN IF to_regclass('public.bundle_active_user_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS bundle_active_user_idx ON bundles(active_user) WHERE active_user IS NOT NULL;
+END IF; END $$;
 -- case insensitive name index
-CREATE UNIQUE INDEX IF NOT EXISTS bundle_name_idx ON bundles(LOWER(name));
+DO $$ BEGIN IF to_regclass('public.bundle_name_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS bundle_name_idx ON bundles(LOWER(name));
+END IF; END $$;
 -- allow only one bundle to be production
-CREATE UNIQUE INDEX IF NOT EXISTS bundle_production_idx ON bundles(is_production) WHERE is_production;
+DO $$ BEGIN IF to_regclass('public.bundle_production_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS bundle_production_idx ON bundles(is_production) WHERE is_production;
+END IF; END $$;
 -- allow only one bundle to be staging
-CREATE UNIQUE INDEX IF NOT EXISTS bundle_staging_idx ON bundles(is_staging) WHERE is_staging;
+DO $$ BEGIN IF to_regclass('public.bundle_staging_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS bundle_staging_idx ON bundles(is_staging) WHERE is_staging;
+END IF; END $$;
 
 
 
@@ -210,6 +316,26 @@ CREATE TABLE IF NOT EXISTS public.site_settings(
   PRIMARY KEY (addon_name, addon_version, site_id, user_name)
 );
 
+-- Private per-user preferences of frontend and desktop tools.
+-- project_name NULL means the preference is global.
+CREATE TABLE IF NOT EXISTS public.user_preferences(
+  user_name VARCHAR NOT NULL REFERENCES public.users(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  project_name VARCHAR REFERENCES public.projects(name) ON DELETE CASCADE ON UPDATE CASCADE,
+  key VARCHAR NOT NULL,
+  data JSONB NOT NULL DEFAULT '{}'::JSONB,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- COALESCE makes the global (NULL) scope unique too
+DO $$ BEGIN IF to_regclass('public.user_preferences_unique_idx') IS NULL THEN
+  CREATE UNIQUE INDEX IF NOT EXISTS user_preferences_unique_idx
+  ON public.user_preferences (user_name, key, (COALESCE(project_name, '')));
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.user_preferences_project_name_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS user_preferences_project_name_idx
+  ON public.user_preferences (project_name);
+END IF; END $$;
+
 
 
 CREATE TABLE IF NOT EXISTS public.addon_data(
@@ -236,11 +362,21 @@ CREATE TABLE IF NOT EXISTS action_config(
   last_used BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())
 );
 
-CREATE INDEX IF NOT EXISTS idx_action_config_addon_name ON action_config (addon_name);
-CREATE INDEX IF NOT EXISTS idx_action_config_addon_version ON action_config (addon_version);
-CREATE INDEX IF NOT EXISTS idx_action_config_project_name ON action_config (project_name);
-CREATE INDEX IF NOT EXISTS idx_action_config_user_name ON action_config (user_name);
-CREATE INDEX IF NOT EXISTS idx_action_config_last_used ON action_config (last_used);
+DO $$ BEGIN IF to_regclass('public.idx_action_config_addon_name') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_action_config_addon_name ON action_config (addon_name);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.idx_action_config_addon_version') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_action_config_addon_version ON action_config (addon_version);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.idx_action_config_project_name') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_action_config_project_name ON action_config (project_name);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.idx_action_config_user_name') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_action_config_user_name ON action_config (user_name);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.idx_action_config_last_used') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS idx_action_config_last_used ON action_config (last_used);
+END IF; END $$;
 
 
 --------------
@@ -282,6 +418,30 @@ CREATE TABLE IF NOT EXISTS public.user_stats(
     date DATE NOT NULL PRIMARY KEY,
     users JSONB NOT NULL DEFAULT '{}'::JSONB
 );
+
+-- Studio-scoped documents (project-scoped ones live in project schemas)
+CREATE TABLE IF NOT EXISTS public.documents(
+    id UUID NOT NULL PRIMARY KEY,
+    kind VARCHAR NOT NULL,
+    label VARCHAR NOT NULL DEFAULT '',
+    data JSONB NOT NULL DEFAULT '{}'::JSONB,
+    payload JSONB NOT NULL DEFAULT '{}'::JSONB,
+    access JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by VARCHAR,
+    updated_by VARCHAR
+);
+
+DO $$ BEGIN IF to_regclass('public.document_kind_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS document_kind_idx ON public.documents(kind);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.document_created_by_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS document_created_by_idx ON public.documents(created_by);
+END IF; END $$;
+DO $$ BEGIN IF to_regclass('public.document_updated_at_idx') IS NULL THEN
+  CREATE INDEX IF NOT EXISTS document_updated_at_idx ON public.documents(updated_at);
+END IF; END $$;
 
 
 -- CREATE THE SITE ID
@@ -343,6 +503,7 @@ BEGIN
     FOR project IN
       SELECT p.name FROM projects AS p JOIN users AS u ON u.name = user_name
       WHERE (show_active_projects IS NULL OR p.active = show_active_projects)
+      AND (p.data->>'isSkeleton' IS DISTINCT FROM  'true')
       AND (
         (
           (u.data->'isManager')::boolean

@@ -6,13 +6,14 @@ from ayon_server.lib.postgres import Postgres
 from .models import EntityListModel, EntityListSummary
 
 
-async def _save_entity_list(
+async def save_entity_list(
     project_name: str,
     payload: EntityListModel,
     *,
     user: UserEntity | None = None,
     sender: str | None = None,
     sender_type: str | None = None,
+    create_events: bool = True,
 ) -> EntityListSummary:
     """
     Save the entity list to the database.
@@ -20,7 +21,10 @@ async def _save_entity_list(
     If the list with the same ID already exists, it will be updated.
     """
 
+    if not await Postgres.is_in_transaction():
+        raise AyonException("save_entity_list must be called within a transaction")
     await Postgres.set_project_schema(project_name)
+
     payload.data["count"] = len(payload.items)
 
     query = """
@@ -125,6 +129,25 @@ async def _save_entity_list(
                     folder_path = $9,
                     updated_at = NOW(),
                     updated_by = $11
+                WHERE (
+                    entity_list_items.entity_list_id,
+                    entity_list_items.entity_id,
+                    entity_list_items.position,
+                    entity_list_items.label,
+                    entity_list_items.attrib,
+                    entity_list_items.data,
+                    entity_list_items.tags,
+                    entity_list_items.folder_path
+                ) IS DISTINCT FROM (
+                    EXCLUDED.entity_list_id,
+                    EXCLUDED.entity_id,
+                    EXCLUDED.position,
+                    EXCLUDED.label,
+                    EXCLUDED.attrib,
+                    EXCLUDED.data,
+                    EXCLUDED.tags,
+                    EXCLUDED.folder_path
+                )
                 """,
                 item.id,
                 payload.id,
@@ -150,6 +173,7 @@ async def _save_entity_list(
     summary = EntityListSummary(
         id=payload.id,
         entity_list_type=payload.entity_list_type,
+        entity_list_folder_id=payload.entity_list_folder_id,
         entity_type=payload.entity_type,
         label=payload.label,
         count=len(payload.items),
@@ -157,41 +181,15 @@ async def _save_entity_list(
 
     description = f"Entity list {payload.label} {mode}"
 
-    await EventStream.dispatch(
-        f"entity_list.{mode}",
-        description=description,
-        summary=summary.dict(),
-        project=project_name,
-        user=user.name if user else None,
-        sender=sender,
-        sender_type=sender_type,
-    )
-    return summary
-
-
-#
-# Transaction wrapper
-#
-
-
-async def save_entity_list(
-    project_name: str,
-    payload: EntityListModel,
-    *,
-    user: UserEntity | None = None,
-    sender: str | None = None,
-    sender_type: str | None = None,
-) -> EntityListSummary:
-    """
-    Save the entity list to the database.
-    If the list with the same ID already exists, it will be updated.
-    """
-
-    async with Postgres.transaction():
-        return await _save_entity_list(
-            project_name,
-            payload,
-            user=user,
+    if create_events:
+        await EventStream.dispatch(
+            f"entity_list.{mode}",
+            description=description,
+            summary=summary.model_dump(),
+            project=project_name,
+            user=user.name if user else None,
             sender=sender,
             sender_type=sender_type,
         )
+
+    return summary

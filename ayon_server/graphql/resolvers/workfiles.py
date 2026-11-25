@@ -10,6 +10,7 @@ from ayon_server.graphql.resolvers.common import (
     ARGFirst,
     ARGHasLinks,
     ARGIds,
+    ARGIncludeInternalFolder,
     ARGLast,
     FieldInfo,
     argdesc,
@@ -18,17 +19,62 @@ from ayon_server.graphql.resolvers.common import (
     resolve,
     sortdesc,
 )
-from ayon_server.graphql.resolvers.pagination import create_pagination
+from ayon_server.graphql.resolvers.pagination import (
+    OrderBy,
+    create_pagination,
+    get_sort_keys,
+    sort_columns,
+    with_tiebreakers,
+)
+from ayon_server.graphql.resolvers.sorting import get_attrib_sort_case
 from ayon_server.graphql.types import Info
+from ayon_server.helpers.hierarchy_cache import AYON_INTERNAL_FOLDER_NAME
 from ayon_server.types import validate_name_list, validate_status_list
-from ayon_server.utils import SQLTool, slugify
+from ayon_server.utils import SQLTool
+
+from .common import (
+    ARGVisibility,
+    EntityVisibility,
+    build_search_conditions,
+)
+
+# Workfile name is not stored - it is the last segment of the path
+# (see workfile_from_record). Both / and \ are treated as separators.
+# The explicit ::text cast makes create_pagination compare cursor values
+# as text (file names such as "2024-01-01T10.30" would otherwise be
+# mistaken for timestamps).
+WORKFILE_NAME_EXPRESSION = r"substring(workfiles.path from '[^/\\]*$')::text"
 
 SORT_OPTIONS = {
-    "name": "workfiles.name",
+    "name": WORKFILE_NAME_EXPRESSION,
+    "path": "workfiles.path",
     "status": "workfiles.status",
     "createdAt": "workfiles.created_at",
     "updatedAt": "workfiles.updated_at",
 }
+
+
+async def get_workfiles_order_by(sort_by: str | list[str] | None) -> OrderBy:
+    """Return the columns to sort workfiles by for the given sort_by value.
+
+    `workfiles.creation_order` is always appended as the last key,
+    so the ordering is total and cursor pagination is stable.
+    """
+    order_by: OrderBy = []
+
+    for sort_key, descending in get_sort_keys(sort_by):
+        columns: list[str] = []
+        if sort_key in SORT_OPTIONS:
+            columns.append(SORT_OPTIONS[sort_key])
+        elif sort_key.startswith("attrib."):
+            attr_case = await get_attrib_sort_case(sort_key[7:], "workfiles.attrib")
+            columns.append(attr_case)
+        else:
+            raise BadRequestException(f"Invalid sort_by value: {sort_key}")
+
+        order_by.extend(sort_columns(columns, descending))
+
+    return with_tiebreakers(order_by, "workfiles.creation_order")
 
 
 async def get_workfiles(
@@ -51,7 +97,9 @@ async def get_workfiles(
     tags: Annotated[list[str] | None, argdesc("List of tags to filter by")] = None,
     has_links: ARGHasLinks = None,
     search: Annotated[str | None, argdesc("Fuzzy text search filter")] = None,
-    sort_by: Annotated[str | None, sortdesc(SORT_OPTIONS)] = None,
+    sort_by: Annotated[list[str] | None, sortdesc(SORT_OPTIONS)] = None,
+    include_internal_folder: ARGIncludeInternalFolder = False,
+    visibility: ARGVisibility = EntityVisibility.ALL,
 ) -> WorkfilesConnection:
     """Return a list of workfiles."""
 
@@ -76,6 +124,18 @@ async def get_workfiles(
         if not ids:
             return WorkfilesConnection()
         sql_conditions.append(f"workfiles.id IN {SQLTool.id_array(ids)}")
+    else:
+        if visibility == EntityVisibility.VISIBLE:
+            sql_conditions.append("workfiles.active AND tasks.active AND f_ex.active")
+        elif visibility == EntityVisibility.HIDDEN:
+            sql_conditions.append(
+                "(NOT workfiles.active OR NOT tasks.active OR NOT f_ex.active)"
+            )
+
+        if not include_internal_folder:
+            sql_conditions.append(
+                f"NOT starts_with(f_ex.path, '{AYON_INTERNAL_FOLDER_NAME}')"
+            )
 
     if task_ids is not None:
         if not task_ids:
@@ -112,11 +172,18 @@ async def get_workfiles(
         sql_conditions.append(f"workfiles.tags @> {SQLTool.array(tags, curly=True)}")
 
     access_list = await create_folder_access_list(root, info)
-    if access_list is not None or search or fields.any_endswith("parents"):
+    if (
+        access_list is not None
+        or search
+        or fields.any_endswith("parents")
+        or fields.any_endswith("path")
+        or visibility != EntityVisibility.ALL
+        or not include_internal_folder
+    ):
         sql_columns.extend(
             [
                 "tasks.name AS _task_name",
-                "hierarchy.path AS _folder_path",
+                "f_ex.path AS _folder_path",
             ]
         )
 
@@ -127,43 +194,34 @@ async def get_workfiles(
                 ON tasks.id = workfiles.task_id
                 """,
                 f"""
-                INNER JOIN project_{project_name}.hierarchy AS hierarchy
-                ON hierarchy.id = tasks.folder_id
+                INNER JOIN project_{project_name}.exported_attributes AS f_ex
+                ON f_ex.folder_id = tasks.folder_id
                 """,
             ]
         )
 
         if access_list is not None:
             sql_conditions.append(
-                f"hierarchy.path like ANY ('{{ {','.join(access_list)} }}')"
+                f"f_ex.path like ANY ('{{ {','.join(access_list)} }}')"
             )
 
     if search:
-        terms = slugify(search, make_set=True, min_length=2)
-        for term in terms:
-            sub_conditions = []
-            term = term.replace("'", "''")  # Escape single quotes
-            sub_conditions.append(f"tasks.name ILIKE '%{term}%'")
-            sub_conditions.append(f"tasks.task_type ILIKE '%{term}%'")
-            sub_conditions.append(f"hierarchy.path ILIKE '%{term}%'")
-            sub_conditions.append(f"workfiles.path ILIKE '%{term}%'")
-
-            condition = " OR ".join(sub_conditions)
-            sql_conditions.append(f"({condition})")
+        if cond := build_search_conditions(
+            search,
+            [
+                "tasks.name",
+                "tasks.task_type",
+                "f_ex.path",
+                "workfiles.path",
+            ],
+        ):
+            sql_conditions.append(cond)
 
     #
     # Pagination
     #
 
-    order_by = ["workfiles.creation_order"]
-
-    if sort_by is not None:
-        if sort_by in SORT_OPTIONS:
-            order_by.insert(0, SORT_OPTIONS[sort_by])
-        elif sort_by.startswith("attrib."):
-            order_by.insert(0, f"workfiles.attrib->>'{sort_by[7:]}'")
-        else:
-            raise ValueError(f"Invalid sort_by value: {sort_by}")
+    order_by = await get_workfiles_order_by(sort_by)
 
     ordering, paging_conds, cursor = create_pagination(
         order_by,

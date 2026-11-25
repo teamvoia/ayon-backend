@@ -10,9 +10,10 @@ from maintenance.maintenance_task import (
 from maintenance.tasks import task_sequence
 
 
-async def run_maintenance():
+async def run_maintenance(task_name: str | None = None) -> None:
     event_id: str | None = None
     start_time = time.monotonic()
+    failed: list[str] = []
 
     try:
         event_id = await EventStream.dispatch(
@@ -22,6 +23,8 @@ async def run_maintenance():
 
         project_list = await get_project_list()
         for task_class in task_sequence:
+            if task_name is not None and task_class.__name__ != task_name:
+                continue
             task = task_class()
             logger.debug(f"Maintenance: {task.description}")
             if isinstance(task, StudioMaintenanceTask):
@@ -31,7 +34,12 @@ async def run_maintenance():
                     status="in_progress",
                     description=description,
                 )
-                await task.main()
+                # One failing task must not stop the others
+                try:
+                    await task.main()
+                except Exception:
+                    log_traceback(f"Maintenance failed: {description}")
+                    failed.append(description)
 
             elif isinstance(task, ProjectMaintenanceTask):
                 for project in project_list:
@@ -41,7 +49,12 @@ async def run_maintenance():
                         status="in_progress",
                         description=description,
                     )
-                    await task.main(project.name)
+                    # A broken project must not stop the other projects
+                    try:
+                        await task.main(project.name)
+                    except Exception:
+                        log_traceback(f"Maintenance failed: {description}")
+                        failed.append(description)
 
     except Exception:
         log_traceback()
@@ -56,10 +69,16 @@ async def run_maintenance():
 
     else:
         elapsed = int(time.monotonic() - start_time)
-        description = f"Maintenance completed in {elapsed} seconds"
+        if failed:
+            description = (
+                f"Maintenance completed in {elapsed} seconds, "
+                f"{len(failed)} failed: {', '.join(failed)}"
+            )
+        else:
+            description = f"Maintenance completed in {elapsed} seconds"
 
         await EventStream.update(
             event_id,
-            status="finished",
+            status="failed" if failed else "finished",
             description=description,
         )

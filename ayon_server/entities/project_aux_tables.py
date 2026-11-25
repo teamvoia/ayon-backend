@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from typing import Literal, NotRequired, Required, TypedDict, overload
 
 from ayon_server.entities.models.submodels import LinkTypeModel
+from ayon_server.exceptions import BadRequestException
 from ayon_server.lib.postgres import Postgres
 
 FolderTypesLiteral = Literal["folder_types"]
@@ -49,7 +50,7 @@ async def aux_table_update(
     project_name: str,
     table: FolderTypesLiteral,
     update_data: Sequence[FolderTypeDict],
-) -> None: ...
+) -> bool: ...
 
 
 @overload
@@ -57,7 +58,7 @@ async def aux_table_update(
     project_name: str,
     table: TaskTypesLiteral,
     update_data: Sequence[TaskTypeDict],
-) -> None: ...
+) -> bool: ...
 
 
 @overload
@@ -65,19 +66,19 @@ async def aux_table_update(
     project_name: str,
     table: StatusesLiteral,
     update_data: Sequence[StatusTypeDict],
-) -> None: ...
+) -> bool: ...
 
 
 @overload
 async def aux_table_update(
     project_name: str, table: TagsLiteral, update_data: Sequence[TagTypeDict]
-) -> None: ...
+) -> bool: ...
 
 
 async def aux_table_update(
     project_name: str, table: str, update_data: Sequence[AuxTableType]
-) -> None:
-    """Update auxiliary table."""
+) -> bool:
+    """Update auxiliary table. Return True if any item was renamed."""
 
     # Fetch the current data first
     old_data = {}
@@ -86,6 +87,7 @@ async def aux_table_update(
     ):
         old_data[row["name"]] = row["data"]
 
+    renamed = False
     position = 0
     for data in update_data:
         position += 1
@@ -107,6 +109,7 @@ async def aux_table_update(
             )
 
             del old_data[original_name]
+            renamed = True
             continue
 
         # Upsert
@@ -133,12 +136,17 @@ async def aux_table_update(
         query = f"DELETE FROM project_{project_name}.{table} WHERE name = ANY($1)"
         await Postgres.execute(query, old_keys)
 
+    return renamed
+
 
 async def link_types_update(
     project_name: str,
     table: str,
     update_data: Sequence[LinkTypeModel],
 ):
+    # avoid circular import (settings.anatomy imports entities)
+    from ayon_server.settings.anatomy.link_types import default_link_type_names
+
     existing_names: list[str] = []
     for row in await Postgres.fetch(f"SELECT name FROM project_{project_name}.{table}"):
         existing_names.append(row["name"])
@@ -171,8 +179,15 @@ async def link_types_update(
             link_type_data.data,
         )
 
-    for name in existing_names:
-        if name not in new_names:
-            await Postgres.execute(
-                f"DELETE FROM project_{project_name}.{table} WHERE name = $1", name
-            )
+    removed_names = [name for name in existing_names if name not in new_names]
+    if required := default_link_type_names.intersection(removed_names):
+        # deleting a link type would cascade-delete all its links
+        raise BadRequestException(
+            f"Link types {', '.join(sorted(required))} are required "
+            "and cannot be deleted"
+        )
+
+    for name in removed_names:
+        await Postgres.execute(
+            f"DELETE FROM project_{project_name}.{table} WHERE name = $1", name
+        )

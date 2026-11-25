@@ -33,7 +33,7 @@ async def set_projects_access(
     current_user: CurrentUser,
     payload: Annotated[
         dict[str, ProjectAccess],
-        Body(example=example),
+        Body(examples=[example]),
     ],
 ) -> EmptyResponse:
     """Set access for multiple projects
@@ -52,7 +52,8 @@ async def set_projects_access(
 
     """
 
-    project_list = await get_project_list()
+    # Skeleton (planning) projects take access groups too
+    project_list = await get_project_list(with_skeleton=True)
     all_project_names = [project.name for project in project_list]
 
     # ensure the user has the necessary permissions
@@ -62,7 +63,7 @@ async def set_projects_access(
             projects_to_check.add(project_name)
 
     for project_name in projects_to_check:
-        current_user.check_permissions("project.access", project_name)
+        current_user.check_permissions("project.access", project_name, write=True)
 
     # Get all active session of the affected users
     sessions = defaultdict(list)

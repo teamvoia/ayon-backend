@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import shutil
+import tarfile
 import tempfile
 import time
 import zipfile
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from ayon_server.config import ayonconfig
 from ayon_server.events import EventStream
 from ayon_server.exceptions import AyonException
+from ayon_server.helpers.download import shorten_url_string
 from ayon_server.logging import log_traceback, logger
 from ayon_server.version import __version__ as ayon_version
 
@@ -90,8 +92,70 @@ def get_addon_info_from_package_yaml(manifest_data: str) -> AddonZipInfo:
     )
 
 
+class AddonArchive:
+    """Read-only access to an addon archive (zip or tar, optionally compressed)
+
+    The format is detected from the file content, not from the extension,
+    because uploaded and downloaded archives are stored without one.
+    """
+
+    def __init__(self, path: str):
+        self._zip: zipfile.ZipFile | None = None
+        self._tar: tarfile.TarFile | None = None
+        # tar first: is_zipfile() is also true for a plain tar that ends with a zip
+        if tarfile.is_tarfile(path):
+            self._tar = tarfile.open(path, "r:*")
+        elif zipfile.is_zipfile(path):
+            self._zip = zipfile.ZipFile(path, "r")
+        else:
+            raise UnsupportedAddonException(
+                "Unsupported archive format. Use zip or tar (gz, bz2, xz)"
+            )
+
+    def __enter__(self) -> "AddonArchive":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        if self._zip is not None:
+            self._zip.close()
+        if self._tar is not None:
+            self._tar.close()
+
+    def read(self, name: str) -> bytes | None:
+        """Return the content of a top-level file, or None if it does not exist"""
+        if self._zip is not None:
+            if name not in self._zip.namelist():
+                return None
+            return self._zip.read(name)
+
+        if self._tar is None:
+            return None
+        # tar archives created with `tar -cf x.tar .` prefix members with "./"
+        for member in reversed(self._tar.getmembers()):
+            if member.isfile() and member.name.removeprefix("./") == name:
+                fileobj = self._tar.extractfile(member)
+                return fileobj.read() if fileobj else None
+        return None
+
+    def extract_all(self, target_dir: str) -> None:
+        if self._zip is not None:
+            for member in self._zip.infolist():
+                extracted_path = self._zip.extract(member, target_dir)
+
+                # Preserve the file permissions
+                original_mode = member.external_attr >> 16
+                if original_mode:
+                    os.chmod(extracted_path, original_mode)
+            return
+
+        assert self._tar is not None
+        # "data" filter rejects absolute paths, path traversal, links pointing
+        # outside the target and special files, while keeping file permissions
+        self._tar.extractall(target_dir, filter="data")
+
+
 def get_addon_zip_info(path: str) -> AddonZipInfo:
-    """Returns the addon name and version from the zip file"""
+    """Returns the addon name and version from the addon archive"""
     zip_info: AddonZipInfo | None = None
     PARSERS = [
         ("manifest.json", get_addon_info_from_manifest),
@@ -99,15 +163,12 @@ def get_addon_zip_info(path: str) -> AddonZipInfo:
         ("package.yml", get_addon_info_from_package_yaml),
         ("package.py", get_addon_info_from_package_py),
     ]
-    with zipfile.ZipFile(path, "r") as zip_ref:
-        names = zip_ref.namelist()
-
+    with AddonArchive(path) as archive:
         for manifest_name, parser in PARSERS:
-            if manifest_name in names:
-                with zip_ref.open(manifest_name) as manifest_file:
-                    manifest = manifest_file.read().decode("utf-8")
-                    zip_info = parser(manifest)
-                    break
+            manifest_data = archive.read(manifest_name)
+            if manifest_data is not None:
+                zip_info = parser(manifest_data.decode("utf-8"))
+                break
 
     # If no manifest was found, raise an exception
 
@@ -120,7 +181,7 @@ def get_addon_zip_info(path: str) -> AddonZipInfo:
         conditions = ayon_version.split(",")
         for condition in conditions:
             condition = condition.strip()
-            if not semver.match(ayon_version, condition):
+            if not semver.Version.parse(ayon_version).match(condition):
                 raise UnsupportedAddonException(
                     f"Ayon version {ayon_version} is not supported by this addon"
                 )
@@ -137,14 +198,8 @@ def unpack_addon_sync(zip_info: AddonZipInfo) -> None:
     target_dir = os.path.join(addon_root_dir, zip_info.name, zip_info.version)
 
     with tempfile.TemporaryDirectory(dir=addon_root_dir) as tmpdirname:
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            for member in zip_ref.infolist():
-                extracted_path = zip_ref.extract(member, tmpdirname)
-
-                # Preserve the file permissions
-                original_mode = member.external_attr >> 16
-                if original_mode:
-                    os.chmod(extracted_path, original_mode)
+        with AddonArchive(zip_path) as archive:
+            archive.extract_all(tmpdirname)
 
         if os.path.isdir(target_dir):
             logger.info(f"Removing existing addon {zip_info.name} {zip_info.version}")
@@ -186,6 +241,8 @@ async def unpack_addon(event_id: str, zip_info: AddonZipInfo):
         event_id,
         description=f"Unpacking addon {zip_info.name} {zip_info.version}",
         status="in_progress",
+        sender="background-installer",
+        sender_type="system",
     )
 
     loop = asyncio.get_event_loop()
@@ -200,27 +257,36 @@ async def unpack_addon(event_id: str, zip_info: AddonZipInfo):
             event_id,
             description=f"Error while unpacking addon: {e}",
             status="failed",
+            sender="background-installer",
+            sender_type="system",
         )
-
-    try:
-        os.remove(zip_path)
-    except Exception as e:
-        logger.error(f"Error while removing zip file: {e}")
+        return
+    finally:
+        try:
+            os.remove(zip_path)
+        except Exception as e:
+            logger.error(f"Error while removing zip file: {e}")
 
     await EventStream.update(
         event_id,
         description=f"Addon {zip_info.name} {zip_info.version} installed",
         status="finished",
+        sender="background-installer",
+        sender_type="system",
     )
 
 
 async def install_addon_from_url(event_id: str, url: str) -> AddonZipInfo:
     """Download the addon zip file from the URL and install it"""
 
+    log_url = shorten_url_string(url, 50)
+
     await EventStream.update(
         event_id,
-        description=f"Downloading addon from URL {url}",
+        description=f"Downloading addon from URL {log_url}",
         status="in_progress",
+        sender="background-installer",
+        sender_type="system",
     )
 
     # Download the zip file
@@ -253,19 +319,24 @@ async def install_addon_from_url(event_id: str, url: str) -> AddonZipInfo:
                                 event_id,
                                 progress=int(percent / 2),
                                 store=False,
+                                sender="background-installer",
+                                sender_type="system",
                             )
                             last_time = time.time()
 
         # Get the addon name and version from the zip file
 
-        zip_info = get_addon_zip_info(zip_path)
+        # in a thread: listing a compressed tar reads the whole archive
+        zip_info = await asyncio.to_thread(get_addon_zip_info, zip_path)
         zip_info.url = url
         await EventStream.update(
             event_id,
             description=f"Installing addon {zip_info.name} {zip_info.version}",
             status="in_progress",
-            summary=zip_info.dict(exclude_none=True),
+            summary=zip_info.model_dump(exclude_none=True),
             progress=50,
+            sender="background-installer",
+            sender_type="system",
         )
 
         # Unpack the addon
@@ -284,6 +355,8 @@ async def install_addon_from_url(event_id: str, url: str) -> AddonZipInfo:
         event_id,
         description=f"Addon {zip_info.name} {zip_info.version} installed",
         status="finished",
+        sender="background-installer",
+        sender_type="system",
     )
 
     return zip_info

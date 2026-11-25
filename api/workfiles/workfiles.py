@@ -1,14 +1,13 @@
 from fastapi import APIRouter
 
-from ayon_server.api.dependencies import (
-    CurrentUser,
-    ProjectName,
-    Sender,
-    SenderType,
-    WorkfileID,
-)
+from ayon_server.api.dependencies import CurrentUser, ProjectName, WorkfileID
 from ayon_server.api.responses import EmptyResponse, EntityIdResponse
 from ayon_server.entities import WorkfileEntity
+from ayon_server.entities.models.workfile import (
+    WorkfileModel,
+    WorkfilePatchModel,
+    WorkfilePostModel,
+)
 from ayon_server.operations.project_level import ProjectLevelOperations
 
 router = APIRouter(tags=["Workfiles"])
@@ -26,7 +25,7 @@ async def get_workfile(
     user: CurrentUser,
     project_name: ProjectName,
     workfile_id: WorkfileID,
-) -> WorkfileEntity.model.main_model:  # type: ignore
+) -> WorkfileModel:
     """Retrieve a version by its ID."""
 
     workfile = await WorkfileEntity.load(project_name, workfile_id)
@@ -41,11 +40,9 @@ async def get_workfile(
 
 @router.post("/projects/{project_name}/workfiles", status_code=201)
 async def create_workfile(
-    post_data: WorkfileEntity.model.post_model,  # type: ignore
+    post_data: WorkfilePostModel,
     user: CurrentUser,
     project_name: ProjectName,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EntityIdResponse:
     """Create a new workfile.
 
@@ -57,14 +54,9 @@ async def create_workfile(
     if not post_data.updated_by:
         post_data.updated_by = post_data.created_by
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
 
-    ops.create("workfile", **post_data.dict(exclude_unset=True))
+    ops.create("workfile", **post_data.model_dump(exclude_unset=True))
     res = await ops.process(can_fail=False, raise_on_error=True)
     entity_id = res.operations[0].entity_id
     return EntityIdResponse(id=entity_id)
@@ -77,23 +69,16 @@ async def create_workfile(
 
 @router.patch("/projects/{project_name}/workfiles/{workfile_id}", status_code=204)
 async def update_workfile(
-    post_data: WorkfileEntity.model.patch_model,  # type: ignore
+    post_data: WorkfilePatchModel,
     user: CurrentUser,
     project_name: ProjectName,
     workfile_id: WorkfileID,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Patch (partially update) a workfile."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
 
-    ops.update("workfile", workfile_id, **post_data.dict(exclude_unset=True))
+    ops.update("workfile", workfile_id, **post_data.model_dump(exclude_unset=True))
     await ops.process(can_fail=False, raise_on_error=True)
     return EmptyResponse()
 
@@ -108,17 +93,10 @@ async def delete_workfile(
     user: CurrentUser,
     project_name: ProjectName,
     workfile_id: WorkfileID,
-    sender: Sender,
-    sender_type: SenderType,
 ) -> EmptyResponse:
     """Delete a workfile."""
 
-    ops = ProjectLevelOperations(
-        project_name,
-        user=user,
-        sender=sender,
-        sender_type=sender_type,
-    )
+    ops = ProjectLevelOperations(project_name, user=user)
     ops.delete("workfile", workfile_id)
     await ops.process(can_fail=False, raise_on_error=True)
     return EmptyResponse()

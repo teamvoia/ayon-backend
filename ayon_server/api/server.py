@@ -2,29 +2,46 @@ import importlib
 import os
 import pathlib
 import sys
+import warnings
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from fastapi.openapi.docs import get_redoc_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+)
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from fastapi.websockets import WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 
-# okay. now the rest
 from ayon_server.api.auth import AuthMiddleware
-from ayon_server.api.dependencies import CurrentUserOptional
+from ayon_server.api.context import RequestContextMiddleware
+from ayon_server.api.dependencies import CurrentUser, CurrentUserOptional, NoTraces
 from ayon_server.api.lifespan import lifespan
 from ayon_server.api.logging import LoggingMiddleware
 from ayon_server.api.messaging import messaging
 from ayon_server.api.metadata import app_meta
+from ayon_server.api.readiness import ReadinessMiddleware
+from ayon_server.api.static import serve_static_file
+from ayon_server.auth.authorization_server import get_authorization_server
 from ayon_server.background.log_collector import log_collector
 from ayon_server.config import ayonconfig
-from ayon_server.exceptions import ForbiddenException
+from ayon_server.deprecations import AyonDeprecationWarning
+from ayon_server.entities import UserEntity
+from ayon_server.exceptions import ForbiddenException, NotFoundException
 from ayon_server.graphql import router as graphql_router
+from ayon_server.graphql import schema as graphql_schema
 from ayon_server.logging import log_traceback, logger
+
+# okay. now the rest
+from ayon_server.models.field_info import format_validation_errors
 
 #
 # We just need the log collector to be initialized.
@@ -41,11 +58,85 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    # Keep a single OpenAPI schema per model (as with Pydantic 1),
+    # so the names of the generated client types do not change.
+    separate_input_output_schemas=False,
+    generate_unique_id_function=lambda route: route.name,
     **app_meta,
 )
 
+app.add_middleware(RequestContextMiddleware)
 app.add_middleware(LoggingMiddleware)
 app.add_middleware(AuthMiddleware)
+app.add_middleware(ReadinessMiddleware)
+
+
+#
+# Liveness / readiness probes
+#
+
+# These live at the root and are registered before the SPA catch-all route.
+# They are registered directly on the app (bypassing
+# init_api/init_addon_endpoints) so they respond as soon as
+# the process is accepting connections - before the database, addons,
+# or the frontend have been initialized.
+
+
+@app.get("/livez", include_in_schema=False, dependencies=[NoTraces])
+async def livez() -> JSONResponse:
+    """Returns 200 while the process is alive and startup has not failed.
+
+    Intended for a Kubernetes livenessProbe: it must not depend on the
+    database, Redis, or addons being ready, otherwise a slow startup
+    (many addons, a slow DB) looks like a crash and the pod gets
+    restarted before it has a chance to finish booting.
+    If the startup task raised an unhandled exception the worker is
+    permanently broken; returning 500 lets the liveness probe trigger
+    a restart instead of leaving it stuck.
+    """
+
+    if getattr(app.state, "startup_failed", False):
+        return JSONResponse(status_code=500, content={"status": "startup failed"})
+    return JSONResponse(status_code=200, content={"status": "alive"})
+
+
+@app.get("/readyz", include_in_schema=False, dependencies=[NoTraces])
+async def readyz() -> JSONResponse:
+    """Returns 200 once startup (db/redis/addons/frontend) has finished.
+
+    Intended for a Kubernetes readinessProbe/startupProbe: while this
+    returns 503 the pod should stay out of Service rotation, but should
+    NOT be restarted.
+    """
+
+    if getattr(app.state, "ready", False):
+        return JSONResponse(status_code=200, content={"status": "ready"})
+    return JSONResponse(status_code=503, content={"status": "starting"})
+
+
+#
+# Well-known documents
+#
+
+# Registered here, before the frontend is mounted to /: an unknown path
+# would otherwise be answered with the web interface and a 200, and
+# clients looking for a document there need a clear 404.
+
+
+@app.api_route(
+    "/.well-known/{path:path}",
+    methods=["GET", "OPTIONS"],
+    include_in_schema=False,
+    dependencies=[NoTraces],
+)
+async def well_known(request: Request, path: str) -> Response:
+    """Serve the documents of the authorization server addon, if there is one."""
+    server = await get_authorization_server()
+    if server is not None:
+        response = await server.handle_well_known(request, path)
+        if response is not None:
+            return response
+    raise NotFoundException(f"File {request.url.path} not found")
 
 
 #
@@ -53,34 +144,11 @@ app.add_middleware(AuthMiddleware)
 #
 
 
-@app.get("/openapi.json", include_in_schema=False)
-async def openapi(user: CurrentUserOptional) -> dict[str, Any]:
-    """Return OpenAPI schema"""
+def check_docs_access(user: UserEntity | None) -> None:
+    """Raise unless the user may read the API documentation and schemas"""
 
     if ayonconfig.disable_rest_docs:
-        raise ForbiddenException("OpenAPI documentation is disabled")
-
-    if ayonconfig.openapi_require_authentication:
-        if user is None:
-            raise ForbiddenException("You must be logged in to access OpenAPI schema")
-
-        if not user.is_manager:
-            raise ForbiddenException("You are not allowed to access OpenAPI schema")
-
-    return get_openapi(
-        title=app_meta["title"],
-        version=app_meta["version"],
-        routes=app.routes,
-        description=app_meta["description"],
-    )
-
-
-@app.get("/docs", include_in_schema=False)
-async def docs(user: CurrentUserOptional) -> HTMLResponse:
-    """Return the OpenAPI documentation page"""
-
-    if ayonconfig.disable_rest_docs:
-        raise ForbiddenException("OpenAPI documentation is disabled")
+        raise ForbiddenException("API documentation is disabled")
 
     if ayonconfig.openapi_require_authentication:
         if user is None:
@@ -91,9 +159,42 @@ async def docs(user: CurrentUserOptional) -> HTMLResponse:
         if not user.is_manager:
             raise ForbiddenException("You are not allowed to access API documentation")
 
+
+@app.get("/openapi.json", include_in_schema=False)
+async def openapi(user: CurrentUserOptional) -> dict[str, Any]:
+    """Return OpenAPI schema"""
+
+    check_docs_access(user)
+
+    return get_openapi(
+        title=app_meta["title"],
+        version=app_meta["version"],
+        routes=app.routes,
+        description=app_meta["description"],
+    )
+
+
+@app.get("/docs/redoc.standalone.js", include_in_schema=False)
+async def redocs_static_js(user: CurrentUserOptional) -> FileResponse:
+    """Serve Redoc static JS file"""
+
+    check_docs_access(user)
+
+    return FileResponse(
+        pathlib.Path("static/redoc.standalone.js"),
+    )
+
+
+@app.get("/docs", include_in_schema=False)
+async def docs(user: CurrentUserOptional) -> HTMLResponse:
+    """Return the OpenAPI documentation page"""
+
+    check_docs_access(user)
+
     return get_redoc_html(
         openapi_url="/openapi.json",
         title=app_meta["title"],
+        redoc_js_url="/docs/redoc.standalone.js",
     )
 
 
@@ -135,6 +236,57 @@ def not_found_handler(request: Request, _):
     )
 
 
+@app.exception_handler(ResponseValidationError)
+async def handle_response_validation_error(
+    request: Request, exc: ResponseValidationError
+) -> JSONResponse:
+    """Serialize models returned by endpoints declaring a dict response.
+
+    With Pydantic 1, FastAPI converted returned models to dicts before
+    validating the response, so endpoints (mostly in addons) could return
+    a model while declaring `dict` as the response type. That is deprecated,
+    but still supported here. The response is serialized without additional
+    headers and background tasks the endpoint may have set.
+
+    Other response validation errors are handled as unhandled exceptions.
+    """
+    route = request.scope.get("route")
+    if (
+        not isinstance(exc.body, BaseModel)
+        or not isinstance(route, APIRoute)
+        or route.response_field is None
+    ):
+        raise exc
+
+    data = exc.body.model_dump(
+        mode="json",
+        by_alias=route.response_model_by_alias,
+        exclude_none=route.response_model_exclude_none,
+    )
+    value, errors = route.response_field.validate(data, {}, loc=("response",))
+    if errors:
+        raise exc
+
+    if exc.endpoint_file:
+        # Reported (as any other deprecation) at the endpoint definition
+        warnings.warn_explicit(
+            f"Endpoint {exc.endpoint_function or route.path} returns "
+            f"{type(exc.body).__name__}, but declares a different response type. "
+            "Return a dict instead.",
+            AyonDeprecationWarning,
+            filename=exc.endpoint_file,
+            lineno=exc.endpoint_line or 0,
+        )
+
+    content = route.response_field.serialize(
+        value,
+        mode="json",
+        by_alias=route.response_model_by_alias,
+        exclude_none=route.response_model_exclude_none,
+    )
+    return JSONResponse(content, status_code=route.status_code or 200)
+
+
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation_error(
     request: Request, exc: RequestValidationError
@@ -168,7 +320,7 @@ async def handle_request_validation_error(
             "detail": detail,
             "path": request.url.path,
             "traceback": traceback_msg.strip(),
-            "errors": exc.errors(),
+            "errors": format_validation_errors(exc.errors()),
         },
     )
 
@@ -185,11 +337,29 @@ app.include_router(
 )
 
 
+@app.get("/schema.graphql", include_in_schema=False)
+async def graphql_schema_sdl(user: CurrentUserOptional) -> PlainTextResponse:
+    """Return the GraphQL schema in SDL
+
+    The first line is a comment with the server title and version, which the
+    SDL itself does not carry (unlike `info.version` in /openapi.json).
+    Follows the same settings as the OpenAPI schema at /openapi.json.
+    """
+
+    check_docs_access(user)
+
+    header = f"# {app_meta['title']} {app_meta['version']}\n\n"
+    return PlainTextResponse(header + graphql_schema.as_str())
+
+
 @app.get("/graphiql", include_in_schema=False)
-def explorer() -> HTMLResponse:
-    page = pathlib.Path("static/graphiql.html").read_text()
-    page = page.replace("{{ SUBSCRIPTION_ENABLED }}", "false")  # TODO
-    return HTMLResponse(page, 200)
+def graphiql_root(_: CurrentUser) -> FileResponse:
+    return serve_static_file("static/graphiql", "index.html")
+
+
+@app.get("/graphiql/{path:path}", include_in_schema=False)
+async def explorer(path: str, _: CurrentUser) -> FileResponse:
+    return serve_static_file("static/graphiql", path)
 
 
 #
@@ -245,12 +415,6 @@ def init_api(target_app: FastAPI, plugin_dir: str = "api") -> None:
             continue
 
         target_app.include_router(module.router, prefix="/api")
-
-    # Use endpoints function names as operation_ids
-    for route in app.routes:
-        if isinstance(route, APIRoute):
-            if route.operation_id is None:
-                route.operation_id = route.name
 
 
 def init_global_static(target_app: FastAPI) -> None:

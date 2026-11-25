@@ -1,16 +1,48 @@
+import asyncio
+import re
 import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
+import shortuuid
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from ayon_server.auth.session import Session
+from ayon_server.auth.authorization_server import get_bearer_challenge
+from ayon_server.auth.preauth import apply_pre_auth_cookie, pre_auth_from_request
+from ayon_server.auth.session import DelegatedAccess, Session, hash_token
 from ayon_server.auth.utils import hash_password
 from ayon_server.entities import UserEntity
 from ayon_server.exceptions import UnauthorizedException
 from ayon_server.lib.postgres import Postgres
 from ayon_server.lib.redis import Redis
 from ayon_server.logging import logger
+from ayon_server.utils.server import get_real_ip_from_request, is_internal_ip
 from ayon_server.utils.strings import parse_access_token, parse_api_key
+
+# Never returned for other users, and not seen by an application acting
+# as the user: they allow logging in as the user
+SECRET_USER_DATA_KEYS = (
+    "password",
+    "apiKey",
+    "apiKeys",
+    "passwordResetRequest",
+    "supportToken",
+    "inviteRequest",
+)
+
+
+# A service acting as a user (``x-as-user``) for an application of that user,
+# such as the MCP service for an MCP client signed in with OAuth, names the
+# application's client id here. The request then gets what the user may do,
+# with the limits of an application. Without it the service would give the
+# application the user's full access, including what applications are
+# refused (``NoDelegatedAccess``) and the user's secret data.
+AS_APPLICATION_HEADER = "x-as-application"
+
+# How long the stand-in application access of one such request lasts. It is
+# never stored: it only marks the request.
+AS_APPLICATION_TTL = 60
 
 
 def access_token_from_request(request: Request) -> str | None:
@@ -31,21 +63,21 @@ async def get_logout_reason(token: str) -> str:
             """
             SELECT description FROM public.events
             WHERE topic = 'auth.logout'
-            AND summary->>'token' = $1
+            AND summary->>'tokenHash' = $1
             AND created_at > NOW() - interval '5 minutes'
             ORDER BY created_at DESC LIMIT 1
             """,
-            token,
+            hash_token(token),
         )
         if res:
             reason = res[0]["description"]
         else:
             reason = "Invalid session"
-        await Redis.set_json("logoutreason", "token", reason, ttl=600)
+        await Redis.set_json("logoutreason", token, reason, ttl=600)
     return reason
 
 
-async def user_from_api_key(api_key: str) -> UserEntity:
+async def user_from_api_key(api_key: str, request: Request) -> UserEntity:
     """Return a user associated with the given API key.
 
     Hashed ApiKey may be stored in the database in two ways:
@@ -66,6 +98,16 @@ async def user_from_api_key(api_key: str) -> UserEntity:
        is the one we are looking for. We also need to check
        if the key is not expired.
     """
+
+    previous_attempts = 0
+    real_ip = get_real_ip_from_request(request)
+    if not is_internal_ip(real_ip):
+        previous_attempts = await Redis.get_json("brute-force-attempts", real_ip) or 0
+        if previous_attempts >= 100:
+            raise UnauthorizedException(
+                "Too many failed authentication attempts. Please try again later."
+            )
+
     hashed_key = hash_password(api_key)
     query = """
         SELECT * FROM public.users
@@ -75,18 +117,28 @@ async def user_from_api_key(api_key: str) -> UserEntity:
             WHERE ak->>'key' = $1
         )
     """
-    if not (result := await Postgres.fetch(query, hashed_key)):
-        raise UnauthorizedException("Invalid API key")
-    user = UserEntity.from_record(result[0])
-    if user.data.get("apiKey") == hashed_key:
-        return user
-    for key_data in user.data.get("apiKeys", []):
-        if key_data.get("key") != hashed_key:
-            continue
-        if key_data.get("expires") and key_data["expires"] < time.time():
-            raise UnauthorizedException("API key has expired")
-        return user
-    raise UnauthorizedException("Invalid API key. This shouldn't happen")
+    if result := await Postgres.fetch(query, hashed_key):
+        user = UserEntity.from_record(result[0])
+        if user.data.get("apiKey") == hashed_key:
+            return user
+        for key_data in user.data.get("apiKeys", []):
+            if key_data.get("key") != hashed_key:
+                continue
+            if not key_data.get("expires") or key_data["expires"] > time.time():
+                return user
+
+    await Session.mark_invalid(api_key)
+
+    if not is_internal_ip(real_ip):
+        logger.trace(
+            f"Failed API key authentication attempt from {real_ip}. "
+            f"Total attempts: {previous_attempts + 1}"
+        )
+        await Redis.incr("brute-force-attempts", real_ip, ttl=600)
+
+    # if the API key is invalid, wait a little to prevent brute-force attacks
+    await asyncio.sleep(0.2)
+    raise UnauthorizedException("Invalid API key")
 
 
 async def user_from_request(request: Request) -> UserEntity:
@@ -106,12 +158,31 @@ async def user_from_request(request: Request) -> UserEntity:
 
     if api_key:
         if (session_data := await Session.check(api_key, request)) is None:
-            user = await user_from_api_key(api_key)
-            session_data = await Session.create(user, request, token=api_key)
-        session_data.is_api_key = True
+            user = await user_from_api_key(api_key, request)
+            session_data = await Session.create(
+                user,
+                request,
+                token=api_key,
+                is_api_key=True,
+            )
+        elif not session_data.is_api_key:
+            # regular session, not an API key session
+            raise UnauthorizedException("Regular session cannot be used as an API key")
+
+        # Sessions stored before is_api_key was persisted lack the flag
+        if not session_data.is_api_key:
+            session_data.is_api_key = True
+            await Redis.set(Session.ns, api_key, session_data.model_dump_json())
 
     elif access_token := access_token_from_request(request):
         session_data = await Session.check(access_token, request)
+        if session_data and session_data.is_api_key:
+            session_data = None  # an API key sent as a Bearer token
+        if session_data and session_data.delegated:
+            # The path the router matches, not one rebuilt from headers
+            if not session_data.delegated.is_issued_for(request.scope["path"]):
+                raise UnauthorizedException("Token is not valid for this resource")
+
     else:
         raise UnauthorizedException("Access token is missing")
 
@@ -124,14 +195,112 @@ async def user_from_request(request: Request) -> UserEntity:
         raise UnauthorizedException(reason)
 
     await Redis.incr("user-requests", session_data.user.name)
-    user = UserEntity.from_record(session_data.user.dict())
+    user = UserEntity.from_record(session_data.user.model_dump())
     user.add_session(session_data)
+    if session_data.delegated:
+        _drop_secrets(user)
 
-    if (x_as_user := request.headers.get("x-as-user")) and user.is_service:
-        # sudo :)
+    x_as_user = request.headers.get("x-as-user")
+    if x_as_user and user.is_service and not session_data.delegated:
+        # sudo :) (not for an application: it may act only as its own user)
         user = await UserEntity.load(x_as_user)
+        client_id = (request.headers.get(AS_APPLICATION_HEADER) or "").strip()
+        if client_id:
+            # Copied, so the service's stored session stays as it is
+            session_data = session_data.model_copy(
+                update={
+                    "delegated": DelegatedAccess(
+                        client_id=client_id,
+                        client_name=client_id,
+                        expires=time.time() + AS_APPLICATION_TTL,
+                    )
+                }
+            )
+            _drop_secrets(user)
+        user.add_session(session_data)
 
     return user
+
+
+def _drop_secrets(user: UserEntity) -> None:
+    """Hide what allows logging in as the user from an application."""
+    for key in SECRET_USER_DATA_KEYS:
+        user.data.pop(key, None)
+
+
+THROTTLERS = [
+    (
+        "GraphQL",
+        lambda request: request.url.path.startswith("/graphql"),
+        10,
+    ),
+    (
+        "Operations",
+        # matches /api/projects/{project_name}/operations
+        lambda request: re.match(r"^/api/projects/[^/]+/operations", request.url.path),
+        2,
+    ),
+]
+
+
+@asynccontextmanager
+async def user_request_throttler(
+    user: UserEntity | None, request: Request
+) -> AsyncGenerator[None]:
+
+    if not user:
+        yield
+        return
+
+    if user.is_service:
+        yield
+        return
+
+    for op_name, matcher, limit in THROTTLERS:
+        if not matcher(request):
+            continue
+
+        assert user.session, "User must have a session"
+        session_token = user.session.token or "xxx"
+        key = f"{user.name}@{session_token}:{op_name}"
+
+        req_count = await Redis.incr("concurrent-requests", key, ttl=60)
+        await Redis.incr("concurrent-requests", "total", ttl=60)
+
+        try:
+            if req_count > limit:
+                short_token = shortuuid.uuid(name=session_token)[:8]
+
+                msg = (
+                    f"Too many concurrent {op_name} requests for "
+                    f"{user.name}@{short_token} ({req_count}) "
+                )
+
+                logger.debug(msg)
+
+                # This warning will be replaced with an exception in the future,
+                # after we get a better understanding of how many concurrent
+                # requests are actually being made by users and when it is appropriate
+                # to block them.
+
+                yield
+
+                if graphql_query := getattr(request.state, "graphql_query", None):
+                    logger.debug(
+                        f"Concurrent request {user.name}@{short_token}: {graphql_query}"
+                    )
+                return
+
+                # raise TooManyRequestsException(msg)
+
+            yield
+            return
+
+        finally:
+            await Redis.decr("concurrent-requests", key)
+            await Redis.decr("concurrent-requests", "total")
+
+    yield
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -147,7 +316,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.user = None
             request.state.unauthorized_reason = str(e)
 
-        with logger.contextualize(**context):
-            response = await call_next(request)
+        request.state.pre_auth = pre_auth_from_request(request)
 
+        user = request.state.user
+        if user is not None and user.session and user.session.delegated:
+            if impersonator := user.session.delegated.impersonator:
+                context["impersonator"] = impersonator
+
+        async with user_request_throttler(request.state.user, request):
+            with logger.contextualize(**context):
+                response = await call_next(request)
+
+        if response.status_code == 401 and "www-authenticate" not in response.headers:
+            # Tell the client where it can get a token, if anywhere
+            if challenge := await get_bearer_challenge(request):
+                response.headers["WWW-Authenticate"] = challenge
+
+        apply_pre_auth_cookie(request, response)
         return response

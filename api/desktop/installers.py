@@ -5,7 +5,7 @@ from typing import Literal
 import aiofiles
 from fastapi import BackgroundTasks, Query, Request
 
-from ayon_server.api.dependencies import CurrentUser
+from ayon_server.api.dependencies import CurrentUser, NoDelegatedAccess
 from ayon_server.api.files import handle_download, handle_upload
 from ayon_server.api.responses import EmptyResponse
 from ayon_server.events import EventStream
@@ -15,6 +15,7 @@ from ayon_server.exceptions import (
     ForbiddenException,
     NotFoundException,
 )
+from ayon_server.helpers.cloud import CloudUtils
 from ayon_server.installer import background_installer
 from ayon_server.installer.models import (
     InstallerManifest,
@@ -77,7 +78,7 @@ def get_manifest(filename: str) -> Installer:
     manifest.sources = [
         m
         for m in manifest.sources
-        if not (m.url and m.url.startswith("https://download.ynput.cloud"))
+        if not (m.url and CloudUtils.is_official_download_link(m.url))
     ]
 
     return manifest
@@ -95,46 +96,10 @@ async def list_installers(
     platform: Platform | None = Query(None, description="Platform of the package"),
     variant: Literal["production", "staging"] | None = Query(None),
 ) -> InstallerListModel:
-    result: list[Installer] = []
-
-    if variant in ["production", "staging"]:
-        r = await Postgres.fetch(
-            f"""
-            SELECT data->>'installer_version' as v
-            FROM bundles WHERE is_{variant} IS TRUE
-            """
-        )
-        if r:
-            version = r[0]["v"]
-        else:
-            raise NotFoundException(f"No {variant} bundle found")
-
-    for filename in iter_names("installers"):
-        try:
-            manifest = get_manifest(filename)
-        except Exception as e:
-            logger.warning(f"Failed to load manifest file {filename}: {e}")
-            continue
-
-        if filename != manifest.filename:
-            logger.warning(
-                f"Filenames in manifest don't match: {filename} != {manifest.filename}"
-            )
-            continue
-
-        # Filtering
-
-        if platform is not None and platform != manifest.platform:
-            continue
-
-        if version is not None and version != manifest.version:
-            continue
-
-        result.append(manifest)
-    return InstallerListModel(installers=result)
+    return await get_installers(version=version, platform=platform, variant=variant)
 
 
-@router.post("/installers", status_code=201)
+@router.post("/installers", status_code=201, dependencies=[NoDelegatedAccess])
 async def create_installer(
     background_tasks: BackgroundTasks,
     user: CurrentUser,
@@ -212,7 +177,7 @@ async def create_installer(
         background_tasks.add_task(background_installer.enqueue, event_id)
 
     async with aiofiles.open(payload.path, "w") as f:
-        await f.write(payload.json(exclude_none=True))
+        await f.write(payload.model_dump_json(exclude_none=True))
 
     return InstallResponseModel(event_id=event_id)
 
@@ -220,11 +185,10 @@ async def create_installer(
 @router.get("/installers/{filename}")
 async def download_installer_file(user: CurrentUser, filename: str):
     installers_dir = get_desktop_dir("installers", for_writing=False)
-    file_path = os.path.join(installers_dir, filename)
-    return await handle_download(file_path)
+    return await handle_download(filename, root_dir=installers_dir)
 
 
-@router.put("/installers/{filename}", status_code=204)
+@router.put("/installers/{filename}", status_code=204, dependencies=[NoDelegatedAccess])
 async def upload_installer_file(user: CurrentUser, request: Request, filename: str):
     if not user.is_admin:
         raise ForbiddenException("Only admins can upload installers")
@@ -234,7 +198,16 @@ async def upload_installer_file(user: CurrentUser, request: Request, filename: s
     if manifest.filename != filename:
         raise AyonException("Filename in manifest does not match")
 
-    return await handle_upload(request, manifest.local_file_path)
+    response = await handle_upload(request, manifest.local_file_path)
+
+    await EventStream.dispatch(
+        "installer.install",
+        description=f"Installed installer: {filename}",
+        summary={"filename": filename},
+        user=user.name,
+        finished=True,
+    )
+    return response
 
 
 @router.delete("/installers/{filename}", status_code=204)
@@ -248,7 +221,9 @@ async def delete_installer_file(user: CurrentUser, filename: str):
     return EmptyResponse(status_code=204)
 
 
-@router.patch("/installers/{filename}", status_code=204)
+@router.patch(
+    "/installers/{filename}", status_code=204, dependencies=[NoDelegatedAccess]
+)
 async def patch_installer(user: CurrentUser, filename: str, payload: SourcesPatchModel):
     """Update sources for an installer"""
     if not user.is_admin:
@@ -262,5 +237,49 @@ async def patch_installer(user: CurrentUser, filename: str, payload: SourcesPatc
     manifest.sources = payload.sources
 
     async with aiofiles.open(manifest.path, "w") as f:
-        await f.write(manifest.json(exclude_none=True))
+        await f.write(manifest.model_dump_json(exclude_none=True))
     return EmptyResponse(status_code=204)
+
+
+async def get_installers(
+    version: str | None = None,
+    platform: Platform | None = None,
+    variant: Literal["production", "staging"] | None = None,
+) -> InstallerListModel:
+    result: list[Installer] = []
+
+    if variant in ["production", "staging"]:
+        r = await Postgres.fetch(
+            f"""
+            SELECT data->>'installer_version' as v
+            FROM bundles WHERE is_{variant} IS TRUE
+            """
+        )
+        if r:
+            version = r[0]["v"]
+        else:
+            raise NotFoundException(f"No {variant} bundle found")
+
+    for filename in iter_names("installers"):
+        try:
+            manifest = get_manifest(filename)
+        except Exception as e:
+            logger.warning(f"Failed to load manifest file {filename}: {e}")
+            continue
+
+        if filename != manifest.filename:
+            logger.warning(
+                f"Filenames in manifest don't match: {filename} != {manifest.filename}"
+            )
+            continue
+
+        # Filtering
+
+        if platform is not None and platform != manifest.platform:
+            continue
+
+        if version is not None and version != manifest.version:
+            continue
+
+        result.append(manifest)
+    return InstallerListModel(installers=result)

@@ -6,7 +6,13 @@ import aiofiles
 import httpx
 from fastapi import Request, Response
 
-from ayon_server.api.dependencies import AllowGuests, CurrentUser, NoTraces, UserName
+from ayon_server.api.dependencies import (
+    AllowGuests,
+    CurrentUser,
+    NoDelegatedAccess,
+    NoTraces,
+    UserName,
+)
 from ayon_server.api.files import image_response_from_bytes
 from ayon_server.config import ayonconfig
 from ayon_server.exceptions import NotFoundException
@@ -82,6 +88,33 @@ def create_initials_svg(
     return svg_template.strip()
 
 
+def create_anonymous_svg(
+    name: str,
+    width: int = 100,
+    height: int = 100,
+    text_color: str = "white",
+) -> str:
+    bg_color = generate_color(f"{name}")
+
+    svg_template = f"""
+    <svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">
+      <rect width="100%" height="100%" fill="{bg_color}"/>
+      <g
+        fill="none"
+        stroke="{text_color}"
+        stroke-width="6"
+        transform="scale(0.75) translate(0 -2)"
+        transform-origin="center"
+      >
+        <circle cx="50" cy="30" r="15" />
+        <path d="M 20 85 L 80 85 A 30 30, 0, 0, 0, 20 85 Z" />
+      </g>
+    </svg>
+    """
+
+    return svg_template.strip()
+
+
 async def load_avatar_file(user_name: str) -> bytes:
     """
     Load the avatar file for a given user.
@@ -134,6 +167,8 @@ async def obtain_avatar(user_name: str) -> bytes:
     )
 
     if not res:
+        if user_name.startswith("anonymous.guest."):
+            return create_anonymous_svg(user_name).encode()
         if user_name.startswith("guest."):
             # We cannot get full name for guests users,
             # as we do not know the current project.
@@ -166,10 +201,13 @@ async def obtain_avatar(user_name: str) -> bytes:
                 except httpx.HTTPStatusError:
                     logger.warning(f"{err} Error: {response.status_code}")
                 else:
-                    avatar_bytes = await process_thumbnail(avatar_bytes, format="JPEG")
-                    logger.debug(
-                        f"Successfully fetched avatar for {user_name} from url"
-                    )
+                    if isinstance(avatar_bytes, bytes):
+                        avatar_bytes = await process_thumbnail(
+                            avatar_bytes, format="JPEG"
+                        )
+                        logger.debug(
+                            f"Successfully fetched avatar for {user_name} from url"
+                        )
 
     if not avatar_bytes:
         full_name = res[0]["full_name"] or ""
@@ -191,7 +229,7 @@ async def get_avatar(user_name: UserName, current_user: CurrentUser) -> Response
     return image_response_from_bytes(avatar_bytes)
 
 
-@router.put("/{user_name}/avatar")
+@router.put("/{user_name}/avatar", dependencies=[NoDelegatedAccess])
 async def upload_avatar(user: CurrentUser, request: Request, user_name: UserName):
     """Uploads a new avatar for the specified user."""
 
@@ -222,7 +260,7 @@ async def upload_avatar(user: CurrentUser, request: Request, user_name: UserName
     await user.save()  # to bump the updated_at field
 
 
-@router.delete("/{user_name}/avatar")
+@router.delete("/{user_name}/avatar", dependencies=[NoDelegatedAccess])
 async def delete_avatar(user: CurrentUser, user_name: UserName):
     if user.name != user_name and not user.is_admin:
         raise NotFoundException("Invalid avatar format")

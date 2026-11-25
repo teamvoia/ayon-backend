@@ -106,7 +106,7 @@ async def task_loader(keys: list[KeyType]) -> list[dict[str, Any] | None]:
     query = f"""
         SELECT
             tasks.*,
-            pf.attrib AS parent_folder_attrib,
+            pf.attrib AS inherited_attributes,
             hierarchy.path AS _folder_path
         FROM project_{project_name}.tasks as tasks
 
@@ -226,13 +226,7 @@ async def latest_version_loader(keys: list[KeyType]) -> list[dict[str, Any] | No
     project_name = get_project_name(keys)
 
     query = f"""
-        WITH reviewables AS (
-            SELECT entity_id FROM project_{project_name}.activity_feed
-            WHERE entity_type = 'version'
-            AND activity_type = 'reviewable'
-        ),
-
-        hero_versions AS (
+        WITH hero_versions AS (
             SELECT version.id id, hero_version.id AS hero_version_id
             FROM project_{project_name}.versions AS version
             JOIN project_{project_name}.versions AS hero_version
@@ -247,7 +241,11 @@ async def latest_version_loader(keys: list[KeyType]) -> list[dict[str, Any] | No
             hierarchy.path AS _folder_path,
             p.name AS _product_name,
             EXISTS (
-                SELECT 1 FROM reviewables WHERE entity_id = v.id
+                SELECT 1 FROM project_{project_name}.activity_feed af
+                WHERE af.entity_id = v.id
+                AND af.entity_type = 'version'
+                AND af.activity_type = 'reviewable'
+                OFFSET 0
             ) AS has_reviewables
         FROM
             project_{project_name}.versions AS v
@@ -262,9 +260,10 @@ async def latest_version_loader(keys: list[KeyType]) -> list[dict[str, Any] | No
         ON hero_versions.id = v.id
 
         WHERE v.id IN (
-            SELECT l.ids[array_upper(l.ids, 1)]
-            FROM project_{project_name}.version_list as l
-            WHERE l.product_id IN {SQLTool.id_array([k[1] for k in keys])}
+            SELECT DISTINCT ON (vv.product_id) vv.id
+            FROM project_{project_name}.versions AS vv
+            WHERE vv.product_id IN {SQLTool.id_array([k[1] for k in keys])}
+            ORDER BY vv.product_id, vv.version DESC
         )
         """
 

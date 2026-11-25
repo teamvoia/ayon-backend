@@ -1,10 +1,16 @@
-from collections.abc import Awaitable
-from typing import Any
+import inspect
+import json
+import uuid
+from collections.abc import Awaitable, Callable, Coroutine
+from functools import wraps
+from typing import Any, Literal, TypeVar, cast
 
+from pydantic import BaseModel
 from redis import asyncio as aioredis
 from redis.asyncio.client import PubSub
 
 from ayon_server.config import ayonconfig
+from ayon_server.logging import logger
 from ayon_server.utils import json_dumps, json_loads
 
 GET_SIZE_SCRIPT = """
@@ -25,6 +31,76 @@ until cursor == "0"
 return total_size
 """
 
+# Delete the lock only if it is still held by the caller. It may have expired
+# and been acquired by another instance in the meantime.
+RELEASE_LOCK_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+"""
+
+# Extend the lock only if it is still held by the caller
+EXTEND_LOCK_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+T = TypeVar("T", bound=Callable[..., Coroutine[Any, Any, Any]])
+
+
+def _make_cache_key(
+    func: Callable[..., Any],
+    ns: str,
+    key_template: str,
+    *args: Any,  # noqa: ANN401
+    **kwargs: Any,  # noqa: ANN401
+) -> str:
+    """
+    Generates the full Redis key from the namespace, key template,
+    and function arguments.
+    """
+    try:
+        sig = inspect.signature(func)
+        bound_args = sig.bind(*args, **kwargs)
+        bound_args.apply_defaults()
+
+        format_args = {
+            k: v
+            for i, (k, v) in enumerate(bound_args.arguments.items())
+            if i > 0 or k != "self"  # Exclude the 'self' argument from key generation
+        }
+
+        key = key_template.format(**format_args)
+
+    except Exception as e:
+        logger.warning(
+            f"Could not format cache key for {func.__name__}. "
+            f"Falling back to default key generation. Error: {e}"
+        )
+
+        sig = inspect.signature(func)
+        params = list(sig.parameters.values())
+
+        skip_first = False
+        if args and params:
+            first_param = params[0]
+            if (
+                first_param is not None
+                and first_param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            ):
+                skip_first = True
+
+        relevant_args = args[1:] if skip_first else args
+        arg_str = "_".join(str(a) for a in relevant_args)
+
+        kwarg_str = "_".join(f"{k}_{v}" for k, v in kwargs.items())
+        key = f"{func.__name__}_{arg_str}_{kwarg_str}"
+
+    return f"{ns}:{key}"
+
 
 class Redis:
     connected: bool = False
@@ -34,10 +110,22 @@ class Redis:
     @classmethod
     async def connect(cls) -> None:
         """Create a Redis connection pool"""
-        cls.redis_pool = aioredis.from_url(ayonconfig.redis_url)
+        # A blocking pool makes requests wait for a free connection.
+        # The default pool raises "Too many connections" instead, which
+        # fails requests (HTTP 500) during bursts of concurrent requests.
+        pool = aioredis.BlockingConnectionPool.from_url(
+            ayonconfig.redis_url,
+            max_connections=ayonconfig.redis_pool_size,
+            timeout=ayonconfig.redis_pool_timeout,
+        )
+        cls.redis_pool = aioredis.Redis.from_pool(pool)
 
         try:
-            res = await cls.redis_pool.ping()
+            t = cls.redis_pool.ping()
+            if isinstance(t, Awaitable):
+                res = await t
+            else:
+                res = t
             if not res:
                 raise ConnectionError("Failed to connect to Redis")
         except Exception as e:
@@ -99,11 +187,61 @@ class Redis:
         await cls.redis_pool.delete(f"{cls.prefix}{namespace}-{key}")
 
     @classmethod
-    async def incr(cls, namespace: str, key: str) -> int:
+    async def acquire_lock(cls, namespace: str, key: str, ttl: int) -> str | None:
+        """Acquire a lock shared by all server instances
+
+        Returns a token needed to release the lock, or None if the lock
+        is held by someone else. The lock expires after `ttl` seconds,
+        so a crashed holder cannot keep it forever.
+        """
+        if not cls.connected:
+            await cls.connect()
+        token = uuid.uuid4().hex
+        acquired = await cls.redis_pool.set(
+            f"{cls.prefix}{namespace}-{key}", token, nx=True, ex=ttl
+        )
+        return token if acquired else None
+
+    @classmethod
+    async def release_lock(cls, namespace: str, key: str, token: str) -> None:
+        """Release a lock acquired with `acquire_lock`"""
+        if not cls.connected:
+            await cls.connect()
+        await cls.redis_pool.eval(
+            RELEASE_LOCK_SCRIPT, 1, f"{cls.prefix}{namespace}-{key}", token
+        )
+
+    @classmethod
+    async def extend_lock(cls, namespace: str, key: str, token: str, ttl: int) -> bool:
+        """Extend a lock acquired with `acquire_lock` to expire in `ttl` seconds
+
+        Returns False if the lock is not held by the caller anymore.
+        """
+        if not cls.connected:
+            await cls.connect()
+        extended = await cls.redis_pool.eval(
+            EXTEND_LOCK_SCRIPT, 1, f"{cls.prefix}{namespace}-{key}", token, ttl
+        )
+        return bool(extended)
+
+    @classmethod
+    async def incr(cls, namespace: str, key: str, *, ttl: int = 0) -> int:
         """Increment a value in Redis"""
         if not cls.connected:
             await cls.connect()
         res = await cls.redis_pool.incr(f"{cls.prefix}{namespace}-{key}")
+        if ttl:
+            await cls.redis_pool.expire(f"{cls.prefix}{namespace}-{key}", ttl)
+        return res
+
+    @classmethod
+    async def decr(cls, namespace: str, key: str, *, ttl: int = 0) -> int:
+        """Decrement a value in Redis"""
+        if not cls.connected:
+            await cls.connect()
+        res = await cls.redis_pool.decr(f"{cls.prefix}{namespace}-{key}")
+        if ttl:
+            await cls.redis_pool.expire(f"{cls.prefix}{namespace}-{key}", ttl)
         return res
 
     @classmethod
@@ -134,15 +272,24 @@ class Redis:
         if not cls.connected:
             await cls.connect()
         keys = await cls.redis_pool.keys(f"{cls.prefix}{namespace}-*")
-        return [
-            key.decode("ascii").removeprefix(f"{cls.prefix}{namespace}-")
-            for key in keys
-        ]
+        result = []
+        for key in keys:
+            if isinstance(key, bytes):
+                key_str = key.decode("ascii")
+            else:
+                key_str = str(key)
+            result.append(key_str.removeprefix(f"{cls.prefix}{namespace}-"))
+        return result
 
     @classmethod
     async def delete_ns(cls, namespace: str):
-        if not cls.connected:
-            await cls.connect()
+        """Delete all keys of the namespace and bump its generation.
+
+        Readers put `generation-<namespace>` in their cache keys, so a build
+        which started before the deletion stores its (stale) result under
+        a key nobody reads anymore. Bumped first, the key is outside the namespace.
+        """
+        await cls.incr("generation", namespace)
         keys = await cls.redis_pool.keys(f"{cls.prefix}{namespace}-*")
         for key in keys:
             await cls.redis_pool.delete(key)
@@ -186,3 +333,84 @@ class Redis:
         if value is None:
             return 0
         return int(value)
+
+    @classmethod
+    def cached(
+        cls,
+        ns: str,
+        key: str,
+        ttl: int = 60 * 5,
+        model: type[BaseModel] | Literal["bytes"] | None = None,
+        auto_extend: bool = False,
+    ) -> Callable[[T], T]:
+        """
+        Decorator to cache the result of an async function in Redis.
+        The function must return a JSON-serializable object.
+        """
+
+        def decorator(func: T) -> T:
+            @wraps(func)
+            async def wrapper(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+                full_key = _make_cache_key(func, ns, key, *args, **kwargs)
+
+                result: T
+
+                if model == "bytes":
+                    cached_result = await cls.get(ns, full_key.removeprefix(f"{ns}:"))
+                else:
+                    cached_result = await cls.get_json(
+                        ns, full_key.removeprefix(f"{ns}:")
+                    )
+
+                if cached_result is not None:
+                    # Too noisy
+                    # logger.trace(f"Cache hit for key: {full_key}")
+                    if model and model != "bytes":
+                        try:
+                            result = cast(T, model(**cached_result))
+                        except (TypeError, json.JSONDecodeError) as e:
+                            logger.error(
+                                f"Failed to parse cached result for {full_key}: {e}"
+                            )
+                            # Fall through to recompute the value
+                    else:
+                        result = cached_result
+
+                    if result:
+                        if auto_extend:
+                            await cls.expire(ns, full_key.removeprefix(f"{ns}:"), ttl)
+                        return result
+
+                logger.trace(f"Cache miss for key: {full_key}")
+                result = await func(*args, **kwargs)
+
+                if result is not None:
+                    try:
+                        if model == "bytes":
+                            await cls.set(
+                                ns,
+                                full_key.removeprefix(f"{ns}:"),
+                                cast(bytes, result),
+                                ttl=ttl,
+                            )
+                        else:
+                            val = (
+                                result.model_dump()
+                                if isinstance(result, BaseModel)
+                                else result
+                            )
+
+                            await cls.set_json(
+                                ns,
+                                full_key.removeprefix(f"{ns}:"),
+                                val,
+                                ttl=ttl,
+                            )
+                    except (TypeError, json.JSONDecodeError, ConnectionError) as e:
+                        logger.warning(f"Failed to set cache for {full_key}: {e}")
+
+                return result
+
+            return wrapper  # type: ignore[return-value]
+
+        return decorator

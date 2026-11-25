@@ -1,25 +1,21 @@
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Annotated, Any
 
 import strawberry
-from strawberry import LazyType
 
-from ayon_server.entities import FolderEntity
 from ayon_server.graphql.nodes.common import BaseNode, ThumbnailInfo
+from ayon_server.graphql.nodes.entity_comment import EntityComment
 from ayon_server.graphql.resolvers.products import get_products
 from ayon_server.graphql.resolvers.tasks import get_tasks
 from ayon_server.graphql.types import Info
-from ayon_server.utils import json_dumps
+from ayon_server.utils import json_dumps, json_loads
 
 if TYPE_CHECKING:
     from ayon_server.graphql.connections import ProductsConnection, TasksConnection
 else:
-    ProductsConnection = LazyType["ProductsConnection", "..connections"]
-    TasksConnection = LazyType["TasksConnection", "..connections"]
-
-
-@FolderEntity.strawberry_attrib()
-class FolderAttribType:
-    pass
+    ProductsConnection = Annotated[
+        "ProductsConnection", strawberry.lazy("..connections")
+    ]
+    TasksConnection = Annotated["TasksConnection", strawberry.lazy("..connections")]
 
 
 @strawberry.type
@@ -34,10 +30,13 @@ class FolderNode(BaseNode):
     status: str
     tags: list[str]
     data: str | None
+    thumbnail_hash: str = strawberry.field()
 
     _project_attrib: strawberry.Private[dict[str, Any]]
     _inherited_attrib: strawberry.Private[dict[str, Any]]
     _folder_path: strawberry.Private[str | None] = None
+
+    latest_comments: list[EntityComment] | None = strawberry.field(default=None)
 
     # GraphQL specifics
 
@@ -46,6 +45,10 @@ class FolderNode(BaseNode):
     task_count: int = strawberry.field(default=0)
     has_versions: bool = strawberry.field(default=False)
     has_reviewables: bool = strawberry.field(default=False)
+    total_folder_count: int = strawberry.field(default=0)
+    total_task_count: int = strawberry.field(default=0)
+    total_product_count: int = strawberry.field(default=0)
+    total_version_count: int = strawberry.field(default=0)
 
     products: ProductsConnection = strawberry.field(
         resolver=get_products,
@@ -82,7 +85,7 @@ class FolderNode(BaseNode):
         return path.split("/")[:-1] if path else []
 
     @strawberry.field
-    async def parent(self, info: Info) -> Optional["FolderNode"]:
+    async def parent(self, info: Info) -> "FolderNode | None":
         if not self.parent_id:
             return None
         record = await info.context["folder_loader"].load(
@@ -96,13 +99,9 @@ class FolderNode(BaseNode):
         )
 
     @strawberry.field
-    def attrib(self) -> FolderAttribType:
-        return FolderAttribType(**self.processed_attrib())
-
-    @strawberry.field
     def own_attrib(self) -> list[str]:
-        """Return a list of attributes that are defined on the task."""
-        return list(self._attrib.keys())
+        """Return a list of attributes that are set on the entity itself."""
+        return self.resolved_attrib().own
 
 
 #
@@ -116,6 +115,7 @@ async def folder_from_record(
     """Construct a folder node from a DB row."""
 
     data = record.get("data") or {}
+    thumbnail_hash = data.get("thumbnailHash") or record["id"][-6:]
 
     if "has_reviewables" in record:
         has_reviewables = record["has_reviewables"]
@@ -131,6 +131,11 @@ async def folder_from_record(
             source_entity_id=thumb_data.get("sourceEntityId"),
             relation=thumb_data.get("relation"),
         )
+
+    try:
+        latest_comments = json_loads(record.get("latest_comments") or "[]")
+    except Exception:
+        latest_comments = []
 
     path = "/" + record.get("path", "").strip("/")
     return FolderNode(
@@ -155,6 +160,12 @@ async def folder_from_record(
         task_count=record.get("task_count", 0),
         has_reviewables=has_reviewables,
         has_versions=record.get("has_versions", False),
+        total_folder_count=record.get("total_folder_count", 0),
+        total_task_count=record.get("total_task_count", 0),
+        total_product_count=record.get("total_product_count", 0),
+        total_version_count=record.get("total_version_count", 0),
+        latest_comments=[EntityComment(**comment) for comment in latest_comments],
+        thumbnail_hash=thumbnail_hash,
         path=path,
         _folder_path=path,
         _attrib=record["attrib"] or {},

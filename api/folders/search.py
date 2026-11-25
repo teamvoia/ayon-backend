@@ -2,10 +2,14 @@ from typing import Annotated
 
 from ayon_server.access.utils import folder_access_list
 from ayon_server.api.dependencies import CurrentUser, ProjectName
+from ayon_server.graphql.resolvers.common import (
+    build_search_conditions,
+    get_resolved_attrib_expression,
+)
 from ayon_server.lib.postgres import Postgres
 from ayon_server.sqlfilter import QueryFilter, build_filter
 from ayon_server.types import Field, OPModel
-from ayon_server.utils import SQLTool, slugify
+from ayon_server.utils import SQLTool
 
 from .router import router
 
@@ -37,6 +41,14 @@ class FolderSearchRequest(OPModel):
         Field(
             title="Folder Text search",
             description="'fulltext' search used to resolve the folders",
+        ),
+    ] = None
+
+    search: Annotated[
+        str | None,
+        Field(
+            title="Global Text search",
+            description="Unified 'fulltext' search applied to both tasks and folders",
         ),
     ] = None
 
@@ -101,6 +113,47 @@ async def search_folders(
     sql_joins = []
     sql_conditions = []
 
+    if payload.search:
+        # global search applied to both task and folders
+        # we create a CTE returning union of task.folder_id and folder.id
+        # matching the search and thenwe join this CTE in the main query
+        # to filter folders
+
+        task_search_cond = build_search_conditions(
+            payload.search,
+            ["tasks.name", "tasks.label", "tasks.task_type", "e.path"],
+        )
+
+        folder_search_cond = build_search_conditions(
+            payload.search,
+            ["folders.name", "folders.label", "e.path"],
+        )
+
+        sql_cte.append(
+            f"""
+            searched AS (
+                SELECT DISTINCT tasks.folder_id
+                FROM project_{project_name}.tasks AS tasks
+                JOIN project_{project_name}.exported_attributes as e
+                ON tasks.folder_id = e.folder_id
+                WHERE {task_search_cond}
+                UNION
+                SELECT DISTINCT folders.id AS folder_id
+                FROM project_{project_name}.folders AS folders
+                JOIN project_{project_name}.exported_attributes as e
+                ON folders.id = e.folder_id
+                WHERE {folder_search_cond}
+            )
+            """
+        )
+
+        sql_joins.append(
+            """
+            JOIN searched AS s
+            ON s.folder_id = folders.id
+            """
+        )
+
     #
     # Filtering by tasks
     #
@@ -113,19 +166,19 @@ async def search_folders(
                 payload.task_filter,
                 table_prefix="tasks",
                 column_whitelist=TASK_ALLOWED_KEYS,
-                column_map={"attrib": "(ex.attrib || tasks.attrib)"},
+                column_map={
+                    "attrib": get_resolved_attrib_expression(
+                        "task", "tasks.attrib", inherited="ex.attrib"
+                    )
+                },
             ):
                 task_conditions.append(tcond)
 
         if payload.task_search:
-            terms = slugify(payload.task_search, make_set=True)
-            for term in terms:
-                cond = f"""(
-                tasks.name ILIKE '{term}%'
-                OR tasks.label ILIKE '{term}%'
-                OR tasks.task_type ILIKE '{term}%'
-                OR ex.path ILIKE '%{term}%'
-                )"""
+            if cond := build_search_conditions(
+                payload.task_search,
+                ["tasks.name", "tasks.label", "tasks.task_type", "ex.path"],
+            ):
                 task_conditions.append(cond)
 
         sql_cte.append(
@@ -157,20 +210,35 @@ async def search_folders(
             column_whitelist=FOLDER_ALLOWED_FIELDS,
             table_prefix="folders",
             column_map={
-                "attrib": "e.attrib",
+                "attrib": get_resolved_attrib_expression(
+                    "folder",
+                    "folders.attrib",
+                    inherited="parent_ex.attrib",
+                    project="pr.attrib",
+                ),
                 "path": "e.path",
             },
         ):
             sql_conditions.append(fcond)
+            sql_joins.extend(
+                [
+                    f"""
+                    LEFT JOIN project_{project_name}.exported_attributes AS parent_ex
+                    ON folders.parent_id = parent_ex.folder_id
+                    """,
+                    f"""
+                    INNER JOIN public.projects AS pr
+                    ON pr.name ILIKE '{project_name}'
+                    """,
+                ]
+            )
 
     if payload.folder_search:
-        terms = slugify(payload.folder_search, make_set=True)
-        for term in terms:
-            sql_conditions.append(
-                f"(folders.name ILIKE '%{term}%' OR "
-                f"folders.label ILIKE '%{term}%' OR "
-                f"e.path ILIKE '%{term}%')"
-            )
+        if cond := build_search_conditions(
+            payload.folder_search,
+            ["folders.name", "folders.label", "e.path"],
+        ):
+            sql_conditions.append(cond)
 
     facl = await folder_access_list(user, project_name, "read")
     if facl is not None:
@@ -196,8 +264,8 @@ async def search_folders(
         {" ".join(sql_joins)}
         {SQLTool.conditions(sql_conditions)}
     """
-    result = []
+    result = set()
     async for row in Postgres.iterate(query):
-        result.append(row["folder_id"])
+        result.add(row["folder_id"])
 
-    return FolderSearchResponse(folder_ids=result)
+    return FolderSearchResponse(folder_ids=list(result))

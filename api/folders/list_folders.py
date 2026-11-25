@@ -11,8 +11,8 @@ from ayon_server.api.dependencies import AllowGuests, CurrentUser, ProjectName
 from ayon_server.helpers.hierarchy_cache import rebuild_hierarchy_cache
 from ayon_server.lib.redis import Redis
 from ayon_server.logging import logger
-from ayon_server.types import OPModel
-from ayon_server.utils import camelize, json_dumps, json_loads
+from ayon_server.types import OPModel, VisibilityOptions
+from ayon_server.utils import RequestCoalescer, camelize, json_dumps, json_loads
 
 from .router import router
 
@@ -25,9 +25,17 @@ def _build_response(
     folder_list: list[dict[str, Any]],
     access_checker: AccessChecker,
     attrib_whitelist: set[str] | None = None,
+    visibility: VisibilityOptions = "all",
 ) -> Response:
     def acl_checker(folder: dict[str, Any]) -> bool:
         return access_checker[folder["path"]]
+
+    def visibility_checker(folder: dict[str, Any]) -> bool:
+        if visibility == "all":
+            return True
+        if visibility == "visible":
+            return folder["active"] and folder["visible"]
+        return not folder["active"] or not folder["visible"]
 
     def attr_parser(folder: dict[str, Any]) -> dict[str, Any]:
         if attrib_whitelist is None:
@@ -58,7 +66,9 @@ def _build_response(
             # {"folders": list(map(attr_parser, filter(acl_checker, folder_list)))},
             {
                 "folders": [
-                    attr_parser(folder) for folder in folder_list if acl_checker(folder)
+                    attr_parser(folder)
+                    for folder in folder_list
+                    if acl_checker(folder) and visibility_checker(folder)
                 ]
             },
         ),
@@ -77,13 +87,18 @@ class FolderListItem(OPModel):
     has_tasks: bool = False
     has_children: bool = False
     has_reviewables: bool = False
-    task_names: list[str] | None
-    tags: list[str] | None
+    thumbnail_hash: str
+    task_names: list[str] | None = None
+    tags: list[str] | None = None
     status: str
     attrib: dict[str, Any] | None = None
+    active: bool = True
+    visible: bool = True
     own_attrib: list[str] | None = None
     created_at: datetime.datetime
     updated_at: datetime.datetime
+    created_by: str | None = None
+    updated_by: str | None = None
 
 
 class FolderListModel(OPModel):
@@ -102,18 +117,8 @@ class FolderListLoader:
         self._executor = ThreadPoolExecutor(max_workers=10)
 
     async def get_folder_list(self, project_name: str) -> list[dict[str, Any]]:
-        async with self._lock:
-            if project_name not in self._current_futures:
-                self._current_futures[project_name] = asyncio.create_task(
-                    self._load_folders(project_name)
-                )
-
-        data = await self._current_futures[project_name]
-
-        async with self._lock:
-            self._current_futures.pop(project_name, None)
-
-        return data
+        coalesce = RequestCoalescer()
+        return await coalesce(self._load_folders, project_name)
 
     async def _load_folders(self, project_name: str) -> list[dict[str, Any]]:
         logger.trace(f"Loading folders for project {project_name}")
@@ -141,6 +146,7 @@ class FolderListLoader:
         folder_list: list[dict[str, Any]],
         access_checker: AccessChecker,
         attrib_whitelist: set[str] | None = None,
+        visibility: VisibilityOptions = "all",
     ) -> Response:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
@@ -149,6 +155,7 @@ class FolderListLoader:
             folder_list,
             access_checker,
             attrib_whitelist,
+            visibility,
         )
 
 
@@ -165,8 +172,17 @@ async def get_folder_list(
     user: CurrentUser,
     project_name: ProjectName,
     attrib: bool = Query(False, description="Include folder attributes"),
+    visibility: VisibilityOptions = Query(
+        "all",
+        description=(
+            "Filter folders by visibility, including ancestor folders. "
+            "'visible' returns only visible folders; 'hidden' returns folders "
+            "that are inactive themselves or have an inactive ancestor. "
+            "'all' (default) returns both."
+        ),
+    ),
 ):
-    """Return all folders in the project. Fast.
+    """Return folders in the project, optionally filtered by visibility.
 
     This is a similar endpoint to /hierarchy, but the result
     is a flat list. additionally, this endpoint should be faster
@@ -205,16 +221,16 @@ async def get_folder_list(
             media_type="application/json",
         )
 
-    start_time = time.monotonic()
+    start_time = time.perf_counter()
     access_checker = AccessChecker()
     await access_checker.load(user, project_name, "read")
 
-    elapsed_time = time.monotonic() - start_time
+    elapsed_time = time.perf_counter() - start_time
     logger.trace(f"Loaded folder access list in {elapsed_time:.3f} seconds")
 
-    start_time = time.monotonic()
+    start_time = time.perf_counter()
     entities = await folder_list_loader.get_folder_list(project_name)
-    elapsed_time = time.monotonic() - start_time
+    elapsed_time = time.perf_counter() - start_time
     ent_count = len(entities)
     me = f"{ent_count} folders {'with' if attrib else 'without'} attr of {project_name}"
     detail = f"{me} fetched in {elapsed_time:.3f} seconds"
@@ -231,5 +247,5 @@ async def get_folder_list(
             logger.debug(f"{user} {project_name} attrib whitelist {attrib_whitelist}")
 
     return await folder_list_loader.build_response(
-        entities, access_checker, attrib_whitelist
+        entities, access_checker, attrib_whitelist, visibility=visibility
     )
